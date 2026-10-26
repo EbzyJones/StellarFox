@@ -18,7 +18,7 @@
     "next": "14.2.3",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
-    "zustand": "^4.5.2"
+    "zustand": "^5.0.16"
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.13.0",
