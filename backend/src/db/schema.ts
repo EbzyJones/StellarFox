@@ -87,6 +87,150 @@ export const probability_snapshots = pgTable(
   }),
 );
 
+// ── Capacity Planning Tables ──────────────────────────────────────────────────
+
+/** Resource metrics - current metric readings */
+export const resourceMetrics = pgTable(
+  'resource_metrics',
+  {
+    id: bigserial('id', { mode: 'number' }).primaryKey(),
+    timestamp: timestamp('timestamp', { withTimezone: true }).notNull().defaultNow(),
+    resourceType: text('resource_type').notNull(), // cpu, memory, disk, connections, etc.
+    metricName: text('metric_name').notNull(), // specific metric name
+    value: numeric('value').notNull(),
+    unit: text('unit').notNull(), // percentage, bytes, count, etc.
+    hostId: text('host_id'), // server/container identifier
+    serviceName: text('service_name'), // service generating metric
+    metadata: jsonb('metadata'), // additional context
+  },
+  (table) => ({
+    timestamp_idx: index('idx_resource_metrics_timestamp').on(table.timestamp),
+    type_name_idx: index('idx_resource_metrics_type_name').on(table.resourceType, table.metricName),
+  }),
+);
+
+/** Capacity trends - aggregated metrics over time periods */
+export const capacityTrends = pgTable(
+  'capacity_trends',
+  {
+    id: bigserial('id', { mode: 'number' }).primaryKey(),
+    resourceType: text('resource_type').notNull(),
+    metricName: text('metric_name').notNull(),
+    periodStart: timestamp('period_start', { withTimezone: true }).notNull(),
+    periodEnd: timestamp('period_end', { withTimezone: true }).notNull(),
+    periodType: text('period_type').notNull(), // 'hourly', 'daily', 'weekly', 'monthly'
+    avgValue: numeric('avg_value').notNull(),
+    minValue: numeric('min_value').notNull(),
+    maxValue: numeric('max_value').notNull(),
+    p95Value: numeric('p95_value'),
+    p99Value: numeric('p99_value'),
+    sampleCount: integer('sample_count').notNull().default(1),
+    trendDirection: text('trend_direction'), // 'increasing', 'decreasing', 'stable'
+    trendRate: numeric('trend_rate'), // rate of change per day
+    volatility: numeric('volatility'), // standard deviation as percent of mean
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    resource_period_idx: index('idx_capacity_trends_resource_period').on(
+      table.resourceType,
+      table.metricName,
+      table.periodType,
+      table.periodStart,
+    ),
+  }),
+);
+
+/** Capacity forecasts - predicted future values */
+export const capacityForecasts = pgTable(
+  'capacity_forecasts',
+  {
+    id: bigserial('id', { mode: 'number' }).primaryKey(),
+    resourceType: text('resource_type').notNull(),
+    metricName: text('metric_name').notNull(),
+    forecastDate: date('forecast_date').notNull(),
+    forecastTimestamp: timestamp('forecast_timestamp', { withTimezone: true }).notNull().defaultNow(),
+    forecastMethod: text('forecast_method').notNull(), // 'linear_regression', 'exponential_smoothing', 'arima'
+    forecastValue: numeric('forecast_value').notNull(),
+    confidenceIntervalLower: numeric('confidence_interval_lower'),
+    confidenceIntervalUpper: numeric('confidence_interval_upper'),
+    confidenceLevel: numeric('confidence_level'), // 0-1
+    modelRSquared: numeric('model_r_squared'), // R² fit value
+    mape: numeric('mape'), // Mean Absolute Percentage Error
+    actualValue: numeric('actual_value'), // actual value when known
+    predictionError: numeric('prediction_error'), // error when actual is known
+    notes: text('notes'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    resource_date_idx: index('idx_capacity_forecasts_resource_date').on(
+      table.resourceType,
+      table.metricName,
+      table.forecastDate,
+    ),
+  }),
+);
+
+/** Capacity thresholds - alert thresholds */
+export const capacityThresholds = pgTable(
+  'capacity_thresholds',
+  {
+    id: serial('id').primaryKey(),
+    resourceType: text('resource_type').notNull(),
+    metricName: text('metric_name').notNull(),
+    warningThreshold: numeric('warning_threshold').notNull(),
+    criticalThreshold: numeric('critical_threshold').notNull(),
+    forecastWarningDays: integer('forecast_warning_days').notNull().default(7),
+    enabled: boolean('enabled').notNull().default(true),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+);
+
+/** Capacity alerts - alert history */
+export const capacityAlerts = pgTable(
+  'capacity_alerts',
+  {
+    id: bigserial('id', { mode: 'number' }).primaryKey(),
+    thresholdId: integer('threshold_id'),
+    resourceType: text('resource_type').notNull(),
+    metricName: text('metric_name').notNull(),
+    alertLevel: text('alert_level').notNull(), // 'warning', 'critical'
+    currentValue: numeric('current_value').notNull(),
+    thresholdValue: numeric('threshold_value').notNull(),
+    alertType: text('alert_type'), // 'current_value', 'forecast_based'
+    resolvedAt: timestamp('resolved_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    resolved_idx: index('idx_capacity_alerts_resolved').on(table.resolvedAt),
+  }),
+);
+
+/** Capacity recommendations - actionable recommendations */
+export const capacityRecommendations = pgTable(
+  'capacity_recommendations',
+  {
+    id: bigserial('id', { mode: 'number' }).primaryKey(),
+    resourceType: text('resource_type').notNull(),
+    metricName: text('metric_name').notNull(),
+    recommendation: text('recommendation').notNull(),
+    urgency: text('urgency').notNull(), // 'low', 'medium', 'high'
+    recommendedAction: text('recommended_action'),
+    estimatedImpact: text('estimated_impact'),
+    implementationEffort: text('implementation_effort'), // 'easy', 'moderate', 'difficult'
+    forecastDate: date('forecast_date'),
+    implemented: boolean('implemented').default(false),
+    implementedAt: timestamp('implemented_at', { withTimezone: true }),
+    notes: text('notes'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    urgency_idx: index('idx_capacity_recommendations_urgency').on(table.urgency),
+  }),
+);
+
 export const bets = pgTable(
   'bets',
   {
