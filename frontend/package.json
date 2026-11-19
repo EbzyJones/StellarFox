@@ -9,7 +9,9 @@
     "start": "next start -p 3000",
     "test": "jest",
     "lint": "next lint",
-    "format": "prettier --write 'src/**/*.{ts,tsx}'",
+    "lint:fix": "next lint --fix",
+    "format": "prettier --write 'src/**/*.{ts,tsx,json}'",
+    "format:check": "prettier --check 'src/**/*.{ts,tsx,json}' '.prettierrc'",
     "test:e2e": "playwright test"
   },
   "dependencies": {

@@ -4,6 +4,15 @@
   "private": true,
   "scripts": {
     "test:e2e": "npm --prefix backend run test:e2e",
-    "test:integration": "npm --prefix backend run test:integration"
+    "test:integration": "npm --prefix backend run test:integration",
+    "format": "npm --prefix frontend run format && npm --prefix backend run format",
+    "format:check": "npm --prefix frontend run format:check && npm --prefix backend run format:check",
+    "lint": "npm --prefix frontend run lint && npm --prefix backend run lint",
+    "lint:fix": "npm --prefix frontend run lint:fix && npm --prefix backend run lint:fix",
+    "postinstall": "husky install"
+  },
+  "devDependencies": {
+    "husky": "^9.0.0",
+    "lint-staged": "^15.2.0"
   }
 }

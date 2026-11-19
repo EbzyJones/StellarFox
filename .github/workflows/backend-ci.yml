@@ -102,6 +102,10 @@ jobs:
         working-directory: backend
         run: npm run lint
 
+      - name: Check code formatting
+        working-directory: backend
+        run: npm run format:check
+
       - name: Build
         working-directory: backend
         run: npm run build
