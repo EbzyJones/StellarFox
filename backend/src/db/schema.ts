@@ -438,6 +438,202 @@ export const user_notifications = pgTable(
   }),
 );
 
+// Analytics tables
+export const analyticsUserSessions = pgTable(
+  'user_sessions',
+  {
+    id: serial('id').primaryKey(),
+    user_id: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+    session_id: text('session_id').notNull().unique(),
+    device_info: jsonb('device_info'),
+    browser: text('browser'),
+    os: text('os'),
+    ip_address: text('ip_address'),
+    started_at: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+    ended_at: timestamp('ended_at', { withTimezone: true }),
+    duration_seconds: integer('duration_seconds'),
+    page_views: integer('page_views').default(0),
+    events_count: integer('events_count').default(0),
+    created_at: timestamp('created_at', { withTimezone: true }).defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => ({
+    user_id_idx: index('user_sessions_user_id_idx').on(table.user_id),
+    session_id_idx: index('user_sessions_session_id_idx').on(table.session_id),
+    started_at_idx: index('user_sessions_started_at_idx').on(table.started_at),
+  }),
+);
+
+export const analyticsUserEvents = pgTable(
+  'user_events',
+  {
+    id: bigserial('id', { mode: 'number' }).primaryKey(),
+    user_id: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+    session_id: text('session_id').notNull().references(() => analyticsUserSessions.session_id, { onDelete: 'cascade' }),
+    event_type: text('event_type').notNull(),
+    event_name: text('event_name').notNull(),
+    page_url: text('page_url'),
+    referrer_url: text('referrer_url'),
+    event_data: jsonb('event_data'),
+    duration_ms: integer('duration_ms'),
+    timestamp: timestamp('timestamp', { withTimezone: true }).notNull().defaultNow(),
+    created_at: timestamp('created_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => ({
+    user_id_idx: index('user_events_user_id_idx').on(table.user_id),
+    session_id_idx: index('user_events_session_id_idx').on(table.session_id),
+    event_type_idx: index('user_events_event_type_idx').on(table.event_type),
+    event_name_idx: index('user_events_event_name_idx').on(table.event_name),
+    timestamp_idx: index('user_events_timestamp_idx').on(table.timestamp),
+  }),
+);
+
+export const pageAnalytics = pgTable(
+  'page_analytics',
+  {
+    id: serial('id').primaryKey(),
+    page_url: text('page_url').notNull(),
+    page_name: text('page_name').notNull(),
+    date: date('date').notNull(),
+    unique_visitors: integer('unique_visitors').default(0),
+    page_views: integer('page_views').default(0),
+    avg_time_on_page_seconds: numeric('avg_time_on_page_seconds').default('0'),
+    bounce_rate: numeric('bounce_rate', { precision: 5, scale: 2 }).default('0'),
+    scroll_depth_avg: numeric('scroll_depth_avg', { precision: 5, scale: 2 }).default('0'),
+    ctr: numeric('ctr', { precision: 5, scale: 2 }).default('0'),
+    conversion_rate: numeric('conversion_rate', { precision: 5, scale: 2 }).default('0'),
+    created_at: timestamp('created_at', { withTimezone: true }).defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => ({
+    page_url_date_idx: index('page_analytics_page_url_date_idx').on(table.page_url, table.date),
+    date_idx: index('page_analytics_date_idx').on(table.date),
+  }),
+);
+
+export const heatmapData = pgTable(
+  'heatmap_data',
+  {
+    id: bigserial('id', { mode: 'number' }).primaryKey(),
+    user_id: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+    session_id: text('session_id').notNull().references(() => analyticsUserSessions.session_id, { onDelete: 'cascade' }),
+    page_url: text('page_url').notNull(),
+    interaction_type: text('interaction_type').notNull(),
+    x_coordinate: integer('x_coordinate').notNull(),
+    y_coordinate: integer('y_coordinate').notNull(),
+    element_id: text('element_id'),
+    element_class: text('element_class'),
+    element_text: text('element_text'),
+    viewport_width: integer('viewport_width'),
+    viewport_height: integer('viewport_height'),
+    timestamp: timestamp('timestamp', { withTimezone: true }).notNull().defaultNow(),
+    created_at: timestamp('created_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => ({
+    user_id_idx: index('heatmap_data_user_id_idx').on(table.user_id),
+    session_id_idx: index('heatmap_data_session_id_idx').on(table.session_id),
+    page_url_idx: index('heatmap_data_page_url_idx').on(table.page_url),
+    interaction_type_idx: index('heatmap_data_interaction_type_idx').on(table.interaction_type),
+  }),
+);
+
+export const sessionRecordings = pgTable(
+  'session_recordings',
+  {
+    id: serial('id').primaryKey(),
+    user_id: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+    session_id: text('session_id').notNull().references(() => analyticsUserSessions.session_id, { onDelete: 'cascade' }),
+    recording_url: text('recording_url'),
+    storage_key: text('storage_key'),
+    duration_seconds: integer('duration_seconds'),
+    event_count: integer('event_count').default(0),
+    file_size_bytes: bigserial('file_size_bytes'),
+    status: text('status').default('processing'),
+    started_at: timestamp('started_at', { withTimezone: true }).notNull(),
+    ended_at: timestamp('ended_at', { withTimezone: true }),
+    created_at: timestamp('created_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => ({
+    user_id_idx: index('session_recordings_user_id_idx').on(table.user_id),
+    session_id_idx: index('session_recordings_session_id_idx').on(table.session_id),
+    status_idx: index('session_recordings_status_idx').on(table.status),
+  }),
+);
+
+export const heatmapAggregates = pgTable(
+  'heatmap_aggregates',
+  {
+    id: serial('id').primaryKey(),
+    page_url: text('page_url').notNull(),
+    date: date('date').notNull(),
+    interaction_type: text('interaction_type').notNull(),
+    heatmap_json: jsonb('heatmap_json').notNull(),
+    sample_count: integer('sample_count').default(0),
+    grid_size: integer('grid_size').default(50),
+    created_at: timestamp('created_at', { withTimezone: true }).defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => ({
+    page_url_date_interaction_idx: index('heatmap_aggregates_page_url_date_interaction_idx').on(
+      table.page_url,
+      table.date,
+      table.interaction_type,
+    ),
+    page_url_interaction_idx: index('heatmap_aggregates_page_url_interaction_idx').on(
+      table.page_url,
+      table.interaction_type,
+    ),
+  }),
+);
+
+export const userAnalyticsSummary = pgTable(
+  'user_analytics_summary',
+  {
+    id: serial('id').primaryKey(),
+    user_id: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+    date: date('date').notNull(),
+    sessions_count: integer('sessions_count').default(0),
+    page_views: integer('page_views').default(0),
+    events_count: integer('events_count').default(0),
+    total_time_seconds: integer('total_time_seconds').default(0),
+    unique_pages_visited: integer('unique_pages_visited').default(0),
+    conversions: integer('conversions').default(0),
+    conversion_value: numeric('conversion_value', { precision: 15, scale: 2 }).default('0'),
+    goals_completed: jsonb('goals_completed'),
+    created_at: timestamp('created_at', { withTimezone: true }).defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => ({
+    user_id_date_idx: index('user_analytics_summary_user_id_date_idx').on(table.user_id, table.date),
+    date_idx: index('user_analytics_summary_date_idx').on(table.date),
+  }),
+);
+
+export const analyticsCustomEvents = pgTable(
+  'analytics_custom_events',
+  {
+    id: bigserial('id', { mode: 'number' }).primaryKey(),
+    user_id: text('user_id'),
+    event_category: text('event_category').notNull(),
+    event_label: text('event_label').notNull(),
+    event_value: integer('event_value'),
+    event_metadata: jsonb('event_metadata'),
+    page_url: text('page_url'),
+    session_id: text('session_id'),
+    timestamp: timestamp('timestamp', { withTimezone: true }).notNull().defaultNow(),
+    created_at: timestamp('created_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => ({
+    user_id_idx: index('analytics_custom_events_user_id_idx').on(table.user_id),
+    event_category_idx: index('analytics_custom_events_event_category_idx').on(table.event_category),
+    event_category_timestamp_idx: index('analytics_custom_events_event_category_timestamp_idx').on(
+      table.event_category,
+      table.timestamp,
+    ),
+    timestamp_idx: index('analytics_custom_events_timestamp_idx').on(table.timestamp),
+  }),
+);
+
 export type Market = typeof markets.$inferSelect;
 export type NewMarket = typeof markets.$inferInsert;
 export type Bet = typeof bets.$inferSelect;
@@ -448,6 +644,18 @@ export type NotificationJob = typeof notification_jobs.$inferSelect;
 export type Dispute = typeof disputes.$inferSelect;
 export type NewDispute = typeof disputes.$inferInsert;
 export type User = typeof users.$inferSelect;
+export type AnalyticsUserSession = typeof analyticsUserSessions.$inferSelect;
+export type NewAnalyticsUserSession = typeof analyticsUserSessions.$inferInsert;
+export type AnalyticsUserEvent = typeof analyticsUserEvents.$inferSelect;
+export type NewAnalyticsUserEvent = typeof analyticsUserEvents.$inferInsert;
+export type PageAnalytics = typeof pageAnalytics.$inferSelect;
+export type HeatmapData = typeof heatmapData.$inferSelect;
+export type NewHeatmapData = typeof heatmapData.$inferInsert;
+export type SessionRecording = typeof sessionRecordings.$inferSelect;
+export type HeatmapAggregate = typeof heatmapAggregates.$inferSelect;
+export type UserAnalyticsSummary = typeof userAnalyticsSummary.$inferSelect;
+export type AnalyticsCustomEvent = typeof analyticsCustomEvents.$inferSelect;
+export type NewAnalyticsCustomEvent = typeof analyticsCustomEvents.$inferInsert;
 export type NewUser = typeof users.$inferInsert;
 export type UserSession = typeof user_sessions.$inferSelect;
 export type PasswordResetToken = typeof password_reset_tokens.$inferSelect;
