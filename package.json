@@ -4,6 +4,8 @@
   "private": true,
   "scripts": {
     "test:e2e": "npm --prefix backend run test:e2e",
-    "test:integration": "npm --prefix backend run test:integration"
+    "test:integration": "npm --prefix backend run test:integration",
+    "docs:check": "python3 scripts/check-code-documentation.py --threshold 25",
+    "docs:coverage": "python3 scripts/check-code-documentation.py --threshold 0"
   }
 }
