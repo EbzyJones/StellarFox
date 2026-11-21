@@ -2,6 +2,9 @@ import { pool } from '../config/db';
 import { isMarketCategory } from '../models/MarketCategory';
 import { cacheDeletePattern } from '../services/cache.service';
 import { recordProbabilitySnapshot } from '../services/MarketService';
+import { sendToDLQ } from '../services/dlq.service';
+import { validateEvent } from '../services/schemaValidator.service';
+import { logger } from '../utils/logger';
 
 export interface RawStellarEvent {
   contract_address: string;
@@ -28,6 +31,19 @@ function parsePayload(data: string): Record<string, unknown> {
 export class StellarEventProcessor implements EventProcessor {
   async process(event: RawStellarEvent): Promise<void> {
     try {
+      // Validate event against schema
+      const validationResult = await validateEvent(event);
+      if (!validationResult.isValid) {
+        logger.warn(
+          {
+            txHash: event.tx_hash,
+            eventType: event.event_type,
+            errors: validationResult.errors,
+          },
+          'Event validation failed'
+        );
+      }
+
       const eventType = event.event_type;
 
       if (eventType === 'market_created') {
@@ -46,14 +62,28 @@ export class StellarEventProcessor implements EventProcessor {
         await this.handleRefundClaimed(event);
       } else {
         // Log unknown event types to prevent silent data loss
-        console.warn(
-          `[Indexer] Unknown event type "${eventType}" on contract ${event.contract_address} ` +
-          `(tx: ${event.tx_hash}, ledger: ${event.ledger_sequence}). ` +
-          `Full event payload: ${JSON.stringify(event)}`,
+        logger.warn(
+          {
+            eventType,
+            contractAddress: event.contract_address,
+            txHash: event.tx_hash,
+            ledgerSequence: event.ledger_sequence,
+          },
+          'Unknown event type'
         );
       }
     } catch (err) {
-      console.error(`Error processing event ${event.tx_hash}:`, err);
+      logger.error(
+        { txHash: event.tx_hash, err },
+        'Error processing event, sending to DLQ'
+      );
+      
+      // Send to DLQ for later retry
+      try {
+        await sendToDLQ(event, err);
+      } catch (dlqErr) {
+        logger.error({ txHash: event.tx_hash, dlqErr }, 'Failed to send event to DLQ');
+      }
     }
   }
 

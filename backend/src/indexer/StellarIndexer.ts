@@ -18,6 +18,8 @@ import {
   getLastProcessedLedger as getTrackerLastProcessed,
   recordProcessedRange,
 } from './ledgerTracker';
+import { getProvider, executeWithFailover, recordSuccess, recordFailure, initializeProviders } from '../services/rpcProvider.service';
+import { logger } from '../utils/logger';
 
 // Raw event shape returned by Stellar RPC / Horizon
 export interface RawStellarEvent {
@@ -34,7 +36,16 @@ const RPC_URL = process.env.STELLAR_RPC_URL || 'https://soroban-testnet.stellar.
 const FACTORY_CONTRACT = process.env.FACTORY_CONTRACT_ADDRESS || '';
 const TREASURY_CONTRACT = process.env.TREASURY_CONTRACT_ADDRESS || '';
 
-const server = new rpc.Server(RPC_URL);
+// Dynamic RPC provider
+let server: rpc.Server;
+
+async function getServer(): Promise<rpc.Server> {
+  if (!server) {
+    const provider = await getProvider();
+    server = new rpc.Server(provider.url);
+  }
+  return server;
+}
 
 /**
  * Publishes to the WebSocket activity feed, if one has been initialised.
@@ -101,6 +112,15 @@ function isLedgerRangeError(err: unknown): boolean {
 
 export async function startIndexer(): Promise<void> {
   const pollInterval = Number(process.env.POLL_INTERVAL_MS ?? 5000);
+  
+  // Initialize RPC providers
+  try {
+    await initializeProviders();
+  } catch (err) {
+    logger.error({ err }, 'Failed to initialize RPC providers');
+    throw err;
+  }
+
   let lastProcessed = await getLastProcessedLedger();
 
   console.log(`[Indexer] Starting from ledger ${lastProcessed}`);
@@ -187,13 +207,20 @@ export async function startIndexer(): Promise<void> {
 }
 
 export async function pollOnce(lastProcessed: number): Promise<number> {
-  const latestLedgerResponse = await server.getLatestLedger();
-  const latestLedger = latestLedgerResponse.sequence;
+  // Get latest ledger with failover support
+  const latestLedger = await executeWithFailover(async (provider) => {
+    const serverInstance = new rpc.Server(provider.url);
+    const latestLedgerResponse = await serverInstance.getLatestLedger();
+    return latestLedgerResponse.sequence;
+  });
 
   if (latestLedger < lastProcessed) {
-    console.warn(
-      `[Indexer] Re-org detected: latest ledger ${latestLedger} is behind ` +
-      `last processed ${lastProcessed}. Resuming from tip without replaying backward.`,
+    logger.warn(
+      {
+        latestLedger,
+        lastProcessed,
+      },
+      'Re-org detected: latest ledger is behind last processed, resuming from tip'
     );
     await saveCheckpoint(latestLedger);
     return latestLedger;
@@ -204,12 +231,16 @@ export async function pollOnce(lastProcessed: number): Promise<number> {
     const ranges = await getProcessedRanges();
     const missing = findMissingRanges(fromLedger + 1, latestLedger, ranges);
     for (const range of missing) {
-      console.log(`[Indexer] Backfilling missing ledgers ${range.start}–${range.end}`);
+      logger.info(
+        { start: range.start, end: range.end },
+        'Backfilling missing ledgers'
+      );
       await backfillAndRecord(range.start, range.end);
       lastProcessed = Math.max(lastProcessed, range.end);
     }
   } catch (err) {
     // Fallback if table not ready
+    logger.debug({ err }, 'Ledger tracker not ready, continuing with standard polling');
   }
 
   for (let seq = lastProcessed + 1; seq <= latestLedger; seq++) {
@@ -217,7 +248,10 @@ export async function pollOnce(lastProcessed: number): Promise<number> {
       await processLedger(seq);
     } catch (err) {
       if (isLedgerRangeError(err)) {
-        console.warn(`[Indexer] Ledger ${seq} unavailable (pruned/out of range), skipping`, err);
+        logger.warn(
+          { ledger: seq },
+          'Ledger unavailable (pruned/out of range), skipping'
+        );
       } else {
         throw err;
       }
@@ -367,60 +401,63 @@ function buildEventPayload(
 // ---------------------------------------------------------------------------
 
 export async function processLedger(ledger_sequence: number): Promise<void> {
-  const request: rpc.Api.GetEventsRequest = {
-    startLedger: ledger_sequence,
-    filters: [
-      {
-        type: 'contract',
-        contractIds: [FACTORY_CONTRACT, TREASURY_CONTRACT].filter(id => id),
-        topics: [['*']]
-      }
-    ],
-    limit: 100
-  };
-
-  const response = await server.getEvents(request);
-  if (!response.events || response.events.length === 0) {
-    return;
-  }
-
-  for (const event of response.events) {
-    const contractId = typeof event.contractId === 'string' ? event.contractId : event.contractId?.toString() || '';
-    const eventType = (event.topic[0] as any)?.sym()?.toString() || 'unknown';
-    const payload = buildEventPayload(eventType, event.topic, event.value);
-    const data = JSON.stringify(payload);
-
-    const rawEvent: RawStellarEvent = {
-      contract_address: contractId,
-      event_type: eventType,
-      topics: event.topic.map((t: any) => scvToString(t)),
-      data,
-      ledger_sequence: event.ledger,
-      ledger_close_time: event.ledgerClosedAt,
-      tx_hash: event.txHash
+  return executeWithFailover(async (provider) => {
+    const server = new rpc.Server(provider.url);
+    const request: rpc.Api.GetEventsRequest = {
+      startLedger: ledger_sequence,
+      filters: [
+        {
+          type: 'contract',
+          contractIds: [FACTORY_CONTRACT, TREASURY_CONTRACT].filter(id => id),
+          topics: [['*']]
+        }
+      ],
+      limit: 100
     };
 
-    await pool.query(
-      `INSERT INTO blockchain_events
-         (contract_address, event_type, payload, ledger_sequence, ledger_close_time, tx_hash)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (tx_hash) DO UPDATE
-         SET contract_address  = EXCLUDED.contract_address,
-             event_type        = EXCLUDED.event_type,
-             payload           = EXCLUDED.payload,
-             ledger_close_time = EXCLUDED.ledger_close_time`,
-      [
-        rawEvent.contract_address,
-        rawEvent.event_type,
-        rawEvent.data,
-        rawEvent.ledger_sequence,
-        rawEvent.ledger_close_time,
-        rawEvent.tx_hash
-      ]
-    );
+    const response = await server.getEvents(request);
+    if (!response.events || response.events.length === 0) {
+      return;
+    }
 
-    await processEvent(rawEvent);
-  }
+    for (const event of response.events) {
+      const contractId = typeof event.contractId === 'string' ? event.contractId : event.contractId?.toString() || '';
+      const eventType = (event.topic[0] as any)?.sym()?.toString() || 'unknown';
+      const payload = buildEventPayload(eventType, event.topic, event.value);
+      const data = JSON.stringify(payload);
+
+      const rawEvent: RawStellarEvent = {
+        contract_address: contractId,
+        event_type: eventType,
+        topics: event.topic.map((t: any) => scvToString(t)),
+        data,
+        ledger_sequence: event.ledger,
+        ledger_close_time: event.ledgerClosedAt,
+        tx_hash: event.txHash
+      };
+
+      await pool.query(
+        `INSERT INTO blockchain_events
+           (contract_address, event_type, payload, ledger_sequence, ledger_close_time, tx_hash)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (tx_hash) DO UPDATE
+           SET contract_address  = EXCLUDED.contract_address,
+               event_type        = EXCLUDED.event_type,
+               payload           = EXCLUDED.payload,
+               ledger_close_time = EXCLUDED.ledger_close_time`,
+        [
+          rawEvent.contract_address,
+          rawEvent.event_type,
+          rawEvent.data,
+          rawEvent.ledger_sequence,
+          rawEvent.ledger_close_time,
+          rawEvent.tx_hash
+        ]
+      );
+
+      await processEvent(rawEvent);
+    }
+  });
 }
 
 export const EVENT_HANDLERS: Record<string, (event: RawStellarEvent) => Promise<void>> = {
