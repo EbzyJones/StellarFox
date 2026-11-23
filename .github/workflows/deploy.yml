@@ -62,7 +62,7 @@ jobs:
     if: needs.determine-environment.outputs.deploy == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Verify Docker images are available
         run: |
@@ -90,7 +90,7 @@ jobs:
       name: staging
       url: https://staging.bankerchanger.app
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Deploy to staging
         run: |
@@ -146,7 +146,7 @@ jobs:
       name: production
       url: https://bankerchanger.app
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Create deployment record
         uses: actions/github-script@v7
@@ -241,7 +241,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Create rollback issue
         uses: actions/github-script@v7

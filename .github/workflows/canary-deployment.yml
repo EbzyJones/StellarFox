@@ -52,7 +52,7 @@ jobs:
     outputs:
       canary_ready: ${{ steps.checks.outputs.ready }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Verify Docker image exists
         run: |
@@ -91,7 +91,7 @@ jobs:
       canary_id: ${{ steps.init.outputs.canary_id }}
       timestamp: ${{ steps.init.outputs.timestamp }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Initialize canary tracking
         id: init
@@ -132,7 +132,7 @@ jobs:
     needs: initialize-canary
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Deploy canary pod
         run: |
@@ -160,7 +160,7 @@ jobs:
     needs: [initialize-canary, deploy-canary-version]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Configure traffic routing
         run: |
@@ -186,7 +186,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Start canary monitoring
         run: |
@@ -277,7 +277,7 @@ jobs:
     if: needs.monitor-canary.outputs.success == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Gradually increase traffic
         run: |
@@ -329,7 +329,7 @@ jobs:
     if: needs.monitor-canary.outputs.success != 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Stop traffic to canary
         run: |
@@ -383,7 +383,7 @@ jobs:
     runs-on: ubuntu-latest
     if: always()
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Record deployment metrics
         run: |
