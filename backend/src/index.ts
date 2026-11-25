@@ -48,6 +48,8 @@ import claimsRouter from "./routes/bet.routes";
 import { startAutoResolutionCron, startAutoLockCron } from "./cron/autoResolution.cron";
 import { startProbabilitySnapshotCron } from "./cron/probabilitySnapshot.cron";
 import { startCleanupCron } from "./cron/cleanup.cron";
+import { initJobQueues, shutdownJobQueues } from "./queue";
+import queueRouter from "./routes/queue.routes";
 import { initActivityFeed, getActivityFeed, tryGetActivityFeed } from "./websocket/realtime";
 import { engagementService } from "./services/engagement.service";
 import { register } from "./services/metrics.service";
@@ -181,6 +183,7 @@ app.use("/api/users", notificationPrefsRouter);
 app.use("/api/disputes", disputesRouter);
 app.use("/api/v1/user-activity", userActivityRouter);
 app.use("/api/admin", adminRouter);
+app.use("/api/admin/queues", queueRouter);
 
 // Versioned API routes. The unversioned routes above remain available for
 // existing clients and retain their current response contracts.
@@ -249,6 +252,9 @@ const server = app.listen(PORT, () => {
   startAutoLockCron();
   startProbabilitySnapshotCron();
   startCleanupCron();
+  // Start the BullMQ workers + metrics + (opt-in) scheduler. Non-blocking and
+  // never throws — a Redis blip must not prevent the API from serving traffic.
+  void initJobQueues();
 });
 
 // Startup health check — catch misconfigured env vars or failed connections early
@@ -284,5 +290,53 @@ engagementService.setRankUpdateListener((updates) => {
     logger.warn({ err }, "Failed to emit leaderboard rank update");
   }
 });
+
+// ---------------------------------------------------------------------------
+// Graceful shutdown — SIGTERM (k8s rolling deploys) / SIGINT (Ctrl-C).
+// Order: stop accepting new connections, drain the HTTP server, drain the job
+// queue (workers wait for in-flight jobs), then release DB + Redis. Each step
+// has a timeout so a stuck dependency cannot hang the process indefinitely.
+// ---------------------------------------------------------------------------
+
+let shuttingDown = false;
+async function gracefulShutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info({ signal }, "Graceful shutdown initiated");
+
+  const hardExitMs = Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 30_000);
+  const hardExitTimer = setTimeout(() => {
+    logger.error({ hardExitMs }, "Graceful shutdown timed out; forcing exit");
+    process.exit(1);
+  }, hardExitMs);
+  hardExitTimer.unref();
+
+  server.close((err) => {
+    if (err) logger.warn({ err: (err as Error).message }, "Error closing HTTP server");
+  });
+
+  try {
+    await shutdownJobQueues();
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, "Error shutting down job queues");
+  }
+  try {
+    await pool.end();
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, "Error closing DB pool");
+  }
+  try {
+    await redis.quit();
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, "Error closing Redis");
+  }
+
+  logger.info({ signal }, "Graceful shutdown complete");
+  clearTimeout(hardExitTimer);
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => void gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => void gracefulShutdown("SIGINT"));
 
 export default app;
