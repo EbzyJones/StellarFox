@@ -56,6 +56,8 @@ import { exportMetrics, register, httpRequestDuration, httpRequestsTotal } from 
 import { setDbAdapter, defaultDbAdapter } from "./services/MarketService";
 import { installQueryMonitor } from "./middleware/query-monitoring";
 import { getCircuitBreakerStatus } from "./utils/circuitBreaker";
+import { initConnectionPoolMonitor, getConnectionPoolMonitor } from "./services/connectionPoolMonitor.service";
+import connectionPoolRouter from "./routes/connection-pool.routes";
 
 // Initialise Sentry before any other code (captures unhandled rejections/exceptions)
 initSentry(env.SENTRY_DSN, env.NODE_ENV);
@@ -65,6 +67,20 @@ setDbAdapter(defaultDbAdapter);
 
 // Install query monitoring on the pg pool — tracks slow queries and exports Prometheus metrics
 installQueryMonitor(pool);
+
+// Initialise connection pool monitor — live metrics, alerting, self-healing
+const poolMonitor = initConnectionPoolMonitor(pool, {
+  maxSize: parseFloat(process.env.DB_POOL_MAX ?? '10') || 10,
+  sampleIntervalMs: parseFloat(process.env.POOL_MONITOR_INTERVAL_MS ?? '10000') || 10_000,
+  disableAlerts: process.env.NODE_ENV === 'test',
+  thresholds: {
+    utilizationWarnPct: parseFloat(process.env.POOL_WARN_PCT ?? '80') || 80,
+    utilizationCriticalPct: parseFloat(process.env.POOL_CRITICAL_PCT ?? '95') || 95,
+    waitingWarnCount: parseInt(process.env.POOL_WAIT_WARN ?? '5', 10) || 5,
+    waitingCriticalCount: parseInt(process.env.POOL_WAIT_CRITICAL ?? '15', 10) || 15,
+  },
+});
+poolMonitor.start();
 
 const app = express();
 
@@ -134,6 +150,10 @@ app.get("/health", async (_req, res) => {
         totalCount: pool.totalCount,
         idleCount: pool.idleCount,
         waitingCount: pool.waitingCount,
+        monitorHealth: (() => {
+          try { return getConnectionPoolMonitor().healthSummary().status; }
+          catch { return 'unavailable'; }
+        })(),
       },
       circuitBreakers: getCircuitBreakerStatus(),
       ...(wsMetrics !== null && { websocket: wsMetrics }),
@@ -202,6 +222,7 @@ app.use("/api/v1", apiV1Router);
 
 app.use("/api/batch", batchRouter);
 app.use("/api/v1/health", systemHealthRouter);
+app.use("/api/pool", connectionPoolRouter);
 app.post("/trading/bet", (_req, res) => res.json({ ok: true }));
 app.post("/wallet/withdraw", (_req, res) => res.json({ ok: true }));
 
