@@ -1,0 +1,229 @@
+# Prometheus Recording Rules for StellarFox bankerchanger
+# These rules pre-compute common aggregations for faster dashboard queries
+
+groups:
+  # ════════════════════════════════════════════════════════════════════════════
+  # HTTP Metrics Recording Rules
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: http_recording_rules
+    interval: 15s
+    rules:
+      # Request rate per endpoint
+      - record: http:requests:rate5m
+        expr: sum(rate(http_requests_total[5m])) by (job, method, route, status_code)
+
+      # Error rate per endpoint
+      - record: http:errors:rate5m
+        expr: sum(rate(http_requests_total{status_code=~"5.."}[5m])) by (job, method, route)
+
+      # Slow request rate per endpoint
+      - record: http:slow_requests:rate5m
+        expr: sum(rate(http_slow_requests_total[5m])) by (job, method, route)
+
+      # HTTP request latency percentiles
+      - record: http:request_duration:p50
+        expr: histogram_quantile(0.50, rate(http_request_duration_seconds_bucket[5m]))
+
+      - record: http:request_duration:p95
+        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))
+
+      - record: http:request_duration:p99
+        expr: histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Database Metrics Recording Rules
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: database_recording_rules
+    interval: 15s
+    rules:
+      # Query rate by operation
+      - record: db:query:rate5m
+        expr: sum(rate(db_query_duration_seconds_count[5m])) by (job, operation)
+
+      # Slow query rate by operation
+      - record: db:slow_queries:rate5m
+        expr: sum(rate(db_slow_queries_total[5m])) by (job, operation)
+
+      # DB query latency percentiles
+      - record: db:query_duration:p50
+        expr: histogram_quantile(0.50, rate(db_query_duration_seconds_bucket[5m]))
+
+      - record: db:query_duration:p95
+        expr: histogram_quantile(0.95, rate(db_query_duration_seconds_bucket[5m]))
+
+      - record: db:query_duration:p99
+        expr: histogram_quantile(0.99, rate(db_query_duration_seconds_bucket[5m]))
+
+      # Connection pool utilization
+      - record: db:pool:utilization
+        expr: (db_connection_pool_size - db_connection_pool_available) / db_connection_pool_size
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Cache & Redis Recording Rules
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: cache_recording_rules
+    interval: 15s
+    rules:
+      # Cache hit rate
+      - record: cache:hit_rate:5m
+        expr: |
+          sum(rate(cache_hits_total[5m])) by (job) /
+          (sum(rate(cache_hits_total[5m])) by (job) + sum(rate(cache_misses_total[5m])) by (job))
+
+      # Redis operation latency percentiles
+      - record: redis:operation_duration:p50
+        expr: histogram_quantile(0.50, rate(redis_operation_duration_seconds_bucket[5m]))
+
+      - record: redis:operation_duration:p95
+        expr: histogram_quantile(0.95, rate(redis_operation_duration_seconds_bucket[5m]))
+
+      - record: redis:operation_duration:p99
+        expr: histogram_quantile(0.99, rate(redis_operation_duration_seconds_bucket[5m]))
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Business Metrics Recording Rules
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: business_recording_rules
+    interval: 15s
+    rules:
+      # Bet placement rate
+      - record: business:bets:rate5m
+        expr: sum(rate(bets_placed_total[5m])) by (job, outcome)
+
+      # Total wagered trend
+      - record: business:wagered:total_1h
+        expr: increase(total_wagered_xlm[1h])
+
+      # Payout rate
+      - record: business:payouts:rate5m
+        expr: sum(rate(bet_payouts_total[5m])) by (job)
+
+      # Payout failure rate
+      - record: business:payouts:failure_rate5m
+        expr: |
+          sum(rate(bet_payout_failures_total[5m])) by (job) /
+          (sum(rate(bet_payouts_total[5m])) by (job) + sum(rate(bet_payout_failures_total[5m])) by (job))
+
+      # Market resolution latency percentiles
+      - record: business:market_resolution:p50
+        expr: histogram_quantile(0.50, rate(market_resolution_latency_seconds_bucket[5m]))
+
+      - record: business:market_resolution:p95
+        expr: histogram_quantile(0.95, rate(market_resolution_latency_seconds_bucket[5m]))
+
+      - record: business:market_resolution:p99
+        expr: histogram_quantile(0.99, rate(market_resolution_latency_seconds_bucket[5m]))
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Blockchain & Smart Contract Recording Rules
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: blockchain_recording_rules
+    interval: 15s
+    rules:
+      # Contract invocation rate by contract and operation
+      - record: blockchain:contract_invocations:rate5m
+        expr: sum(rate(contract_invocations_total[5m])) by (job, contract, operation)
+
+      # Contract failure rate by contract and operation
+      - record: blockchain:contract_failures:rate5m
+        expr: sum(rate(contract_invocation_failures_total[5m])) by (job, contract, operation, error_type)
+
+      # Contract invocation latency percentiles
+      - record: blockchain:contract_latency:p50
+        expr: histogram_quantile(0.50, rate(contract_invocation_latency_seconds_bucket[5m]))
+
+      - record: blockchain:contract_latency:p95
+        expr: histogram_quantile(0.95, rate(contract_invocation_latency_seconds_bucket[5m]))
+
+      - record: blockchain:contract_latency:p99
+        expr: histogram_quantile(0.99, rate(contract_invocation_latency_seconds_bucket[5m]))
+
+      # Blockchain event processing rate
+      - record: blockchain:events:rate5m
+        expr: sum(rate(blockchain_events_processed_total[5m])) by (job, event_type, status)
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Indexer Recording Rules
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: indexer_recording_rules
+    interval: 10s
+    rules:
+      # Event processing rate
+      - record: indexer:events:rate1m
+        expr: sum(rate(indexer_events_processed_success_total[1m])) by (job)
+
+      # Event processing error rate
+      - record: indexer:events:error_rate1m
+        expr: |
+          sum(rate(indexer_events_processed_failure_total[1m])) by (job) /
+          (sum(rate(indexer_events_processed_success_total[1m])) by (job) +
+           sum(rate(indexer_events_processed_failure_total[1m])) by (job))
+
+      # Event processing latency percentiles
+      - record: indexer:event_latency:p50
+        expr: histogram_quantile(0.50, rate(indexer_event_processing_latency_ms_bucket[1m]))
+
+      - record: indexer:event_latency:p95
+        expr: histogram_quantile(0.95, rate(indexer_event_processing_latency_ms_bucket[1m]))
+
+      - record: indexer:event_latency:p99
+        expr: histogram_quantile(0.99, rate(indexer_event_processing_latency_ms_bucket[1m]))
+
+      # Batch processing rate
+      - record: indexer:batches:rate1m
+        expr: sum(rate(indexer_batches_processed_success_total[1m])) by (job)
+
+      # Batch processing latency percentiles
+      - record: indexer:batch_latency:p50
+        expr: histogram_quantile(0.50, rate(indexer_batch_processing_latency_ms_bucket[1m]))
+
+      - record: indexer:batch_latency:p95
+        expr: histogram_quantile(0.95, rate(indexer_batch_processing_latency_ms_bucket[1m]))
+
+      - record: indexer:batch_latency:p99
+        expr: histogram_quantile(0.99, rate(indexer_batch_processing_latency_ms_bucket[1m]))
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Resource Utilization Recording Rules
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: resource_recording_rules
+    interval: 30s
+    rules:
+      # Memory usage trend
+      - record: resource:memory:max1h
+        expr: max_over_time(memory_usage_percent[1h])
+
+      - record: resource:memory:avg1h
+        expr: avg_over_time(memory_usage_percent[1h])
+
+      # CPU usage trend
+      - record: resource:cpu:max1h
+        expr: max_over_time(cpu_usage_percent[1h])
+
+      - record: resource:cpu:avg1h
+        expr: avg_over_time(cpu_usage_percent[1h])
+
+      # Event loop lag trend
+      - record: resource:event_loop_lag:max1m
+        expr: max_over_time(event_loop_lag_ms[1m])
+
+      - record: resource:event_loop_lag:avg1m
+        expr: avg_over_time(event_loop_lag_ms[1m])
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Error Rate Recording Rules
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: error_recording_rules
+    interval: 15s
+    rules:
+      # Application errors rate
+      - record: errors:application:rate5m
+        expr: sum(rate(application_errors_total[5m])) by (job, error_type)
+
+      # Database errors rate
+      - record: errors:database:rate5m
+        expr: sum(rate(database_errors_total[5m])) by (job, error_type)
+
+      # External service errors rate
+      - record: errors:external_service:rate5m
+        expr: sum(rate(external_service_errors_total[5m])) by (job, service)

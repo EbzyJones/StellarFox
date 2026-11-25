@@ -1,0 +1,120 @@
+# Prometheus Configuration with Comprehensive Metrics Collection
+# Updated for StellarFox bankerchanger with business, latency, and resource metrics
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'production'
+    environment: 'prod'
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - 'alertmanager:9093'
+
+rule_files:
+  - '/etc/prometheus/rules/alerts.yml'
+  - '/etc/prometheus/rules/recording-rules.yml'
+
+scrape_configs:
+  # ════════════════════════════════════════════════════════════════════════════
+  # Backend Service Metrics
+  # ════════════════════════════════════════════════════════════════════════════
+  - job_name: 'bankerchanger-backend'
+    static_configs:
+      - targets: ['backend:3000']
+    metrics_path: '/metrics/export'
+    params:
+      format: ['json']
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+
+  # Backend Prometheus native metrics endpoint
+  - job_name: 'bankerchanger-backend-native'
+    static_configs:
+      - targets: ['backend:9090']
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Indexer Service Metrics
+  # ════════════════════════════════════════════════════════════════════════════
+  - job_name: 'bankerchanger-indexer'
+    static_configs:
+      - targets: ['indexer:9091']
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+    scrape_timeout: 5s
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+
+  # Indexer custom metrics endpoint
+  - job_name: 'bankerchanger-indexer-custom'
+    static_configs:
+      - targets: ['indexer:9091']
+    metrics_path: '/metrics/indexer'
+    scrape_interval: 10s
+    scrape_timeout: 5s
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Database Metrics (via pg_exporter if available)
+  # ════════════════════════════════════════════════════════════════════════════
+  - job_name: 'postgresql'
+    static_configs:
+      - targets: ['pg-exporter:9187']
+    scrape_interval: 30s
+    scrape_timeout: 10s
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Redis Metrics (via redis_exporter if available)
+  # ════════════════════════════════════════════════════════════════════════════
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+    scrape_interval: 30s
+    scrape_timeout: 10s
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Prometheus Self-Monitoring
+  # ════════════════════════════════════════════════════════════════════════════
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+    scrape_interval: 15s
+    scrape_timeout: 10s
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Node Exporter (System Metrics)
+  # ════════════════════════════════════════════════════════════════════════════
+  - job_name: 'node'
+    static_configs:
+      - targets: ['node-exporter:9100']
+    scrape_interval: 60s
+    scrape_timeout: 10s
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: '([^:]+)(?::\d+)?'
+        replacement: '${1}'
+        target_label: instance
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Docker Container Metrics (if using cAdvisor)
+  # ════════════════════════════════════════════════════════════════════════════
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']
+    scrape_interval: 60s
+    scrape_timeout: 10s

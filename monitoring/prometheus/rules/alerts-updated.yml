@@ -1,0 +1,351 @@
+# Prometheus Alert Rules for StellarFox bankerchanger
+# Covers critical operations, latency, error rates, and resource utilization
+
+groups:
+  # ════════════════════════════════════════════════════════════════════════════
+  # HTTP & API Alerts
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: http_alerts
+    interval: 1m
+    rules:
+      - alert: HighHttpErrorRate
+        expr: |
+          (sum(rate(http_requests_total{status_code=~"5.."}[5m])) by (job)) / 
+          (sum(rate(http_requests_total[5m])) by (job)) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: 'High HTTP error rate on {{ $labels.job }}'
+          description: 'Error rate is {{ $value | humanizePercentage }} for job {{ $labels.job }}'
+
+      - alert: SlowHttpRequests
+        expr: |
+          (sum(rate(http_slow_requests_total[5m])) by (job)) / 
+          (sum(rate(http_requests_total[5m])) by (job)) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: 'High rate of slow HTTP requests on {{ $labels.job }}'
+          description: '{{ $value | humanizePercentage }} of requests are slow'
+
+      - alert: HttpRequestLatencyHigh
+        expr: |
+          histogram_quantile(0.95, http_request_duration_seconds_bucket) > 2
+        for: 5m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: 'High HTTP request latency (p95) on {{ $labels.job }}'
+          description: 'P95 latency is {{ $value | humanizeDuration }}'
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Database Alerts
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: database_alerts
+    interval: 1m
+    rules:
+      - alert: SlowDatabaseQueries
+        expr: |
+          (sum(rate(db_slow_queries_total[5m])) by (job)) > 10
+        for: 5m
+        labels:
+          severity: warning
+          component: database
+        annotations:
+          summary: 'High rate of slow database queries on {{ $labels.job }}'
+          description: '{{ $value | humanize }} slow queries per second'
+
+      - alert: DatabaseQueryLatencyHigh
+        expr: |
+          histogram_quantile(0.99, db_query_duration_seconds_bucket) > 1
+        for: 5m
+        labels:
+          severity: warning
+          component: database
+        annotations:
+          summary: 'High database query latency (p99) on {{ $labels.job }}'
+          description: 'P99 latency is {{ $value | humanizeDuration }}'
+
+      - alert: DatabaseConnectionPoolExhausted
+        expr: |
+          (db_connection_pool_available / db_connection_pool_size) < 0.1
+        for: 2m
+        labels:
+          severity: critical
+          component: database
+        annotations:
+          summary: 'Database connection pool nearly exhausted on {{ $labels.job }}'
+          description: 'Only {{ $value | humanizePercentage }} connections available'
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Cache & Redis Alerts
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: cache_alerts
+    interval: 1m
+    rules:
+      - alert: LowCacheHitRate
+        expr: |
+          (sum(rate(cache_hits_total[5m])) by (job)) / 
+          ((sum(rate(cache_hits_total[5m])) by (job)) + 
+           (sum(rate(cache_misses_total[5m])) by (job))) < 0.6
+        for: 5m
+        labels:
+          severity: warning
+          component: cache
+        annotations:
+          summary: 'Low cache hit rate on {{ $labels.job }}'
+          description: 'Cache hit rate is {{ $value | humanizePercentage }}'
+
+      - alert: RedisOperationLatencyHigh
+        expr: |
+          histogram_quantile(0.95, redis_operation_duration_seconds_bucket) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          component: cache
+        annotations:
+          summary: 'High Redis operation latency (p95) on {{ $labels.job }}'
+          description: 'P95 latency is {{ $value | humanizeDuration }}'
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Business Metrics Alerts
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: business_alerts
+    interval: 1m
+    rules:
+      - alert: MarketResolutionDelayed
+        expr: |
+          histogram_quantile(0.95, market_resolution_latency_seconds_bucket) > 300
+        for: 10m
+        labels:
+          severity: warning
+          component: business
+        annotations:
+          summary: 'Market resolution taking longer than expected'
+          description: 'P95 market resolution time is {{ $value | humanizeDuration }}'
+
+      - alert: BetPayoutFailuresIncreasing
+        expr: |
+          increase(bet_payout_failures_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: critical
+          component: business
+        annotations:
+          summary: 'High rate of bet payout failures'
+          description: '{{ $value | humanize }} payout failures in the last 5 minutes'
+
+      - alert: LowBetActivity
+        expr: |
+          increase(bets_placed_total[1h]) == 0
+        for: 1h
+        labels:
+          severity: warning
+          component: business
+        annotations:
+          summary: 'No bets placed in the last hour'
+          description: 'Consider checking market availability and connectivity'
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Blockchain & Smart Contract Alerts
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: blockchain_alerts
+    interval: 1m
+    rules:
+      - alert: ContractInvocationFailureRate
+        expr: |
+          (sum(rate(contract_invocation_failures_total[5m])) by (contract, operation)) / 
+          ((sum(rate(contract_invocations_total[5m])) by (contract, operation)) +
+           (sum(rate(contract_invocation_failures_total[5m])) by (contract, operation))) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          component: blockchain
+        annotations:
+          summary: 'High contract invocation failure rate for {{ $labels.contract }}/{{ $labels.operation }}'
+          description: 'Failure rate is {{ $value | humanizePercentage }}'
+
+      - alert: ContractInvocationLatencyHigh
+        expr: |
+          histogram_quantile(0.99, contract_invocation_latency_seconds_bucket) > 10
+        for: 5m
+        labels:
+          severity: warning
+          component: blockchain
+        annotations:
+          summary: 'High contract invocation latency (p99)'
+          description: 'P99 latency is {{ $value | humanizeDuration }}'
+
+      - alert: LedgerContinuityBreaks
+        expr: |
+          increase(ledger_continuity_breaks_total[1h]) > 3
+        for: 10m
+        labels:
+          severity: critical
+          component: blockchain
+        annotations:
+          summary: 'Multiple ledger continuity breaks detected'
+          description: '{{ $value | humanize }} continuity breaks in the last hour'
+
+      - alert: BlockchainEventProcessingBacklog
+        expr: |
+          blockchain_event_queue_depth > 1000
+        for: 5m
+        labels:
+          severity: warning
+          component: blockchain
+        annotations:
+          summary: 'Large backlog of blockchain events'
+          description: '{{ $value | humanize }} events pending processing'
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Indexer Alerts
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: indexer_alerts
+    interval: 1m
+    rules:
+      - alert: IndexerEventProcessingErrors
+        expr: |
+          increase(indexer_events_processed_failure_total[5m]) > 100
+        for: 5m
+        labels:
+          severity: critical
+          component: indexer
+        annotations:
+          summary: 'High rate of indexer event processing errors'
+          description: '{{ $value | humanize }} events failed in the last 5 minutes'
+
+      - alert: IndexerEventLatencyHigh
+        expr: |
+          histogram_quantile(0.95, indexer_event_processing_latency_ms_bucket) > 500
+        for: 5m
+        labels:
+          severity: warning
+          component: indexer
+        annotations:
+          summary: 'High indexer event processing latency (p95)'
+          description: 'P95 latency is {{ $value | humanize }}ms'
+
+      - alert: IndexerQueueBacklog
+        expr: |
+          indexer_queue_depth > 5000
+        for: 10m
+        labels:
+          severity: critical
+          component: indexer
+        annotations:
+          summary: 'Large backlog in indexer event queue'
+          description: '{{ $value | humanize }} events pending processing'
+
+      - alert: IndexerBatchFailureRate
+        expr: |
+          (increase(indexer_batches_processed_failure_total[5m])) / 
+          ((increase(indexer_batches_processed_success_total[5m])) + 
+           (increase(indexer_batches_processed_failure_total[5m]))) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          component: indexer
+        annotations:
+          summary: 'High indexer batch failure rate'
+          description: 'Failure rate is {{ $value | humanizePercentage }}'
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Resource Utilization Alerts
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: resource_alerts
+    interval: 1m
+    rules:
+      - alert: HighMemoryUsage
+        expr: |
+          memory_usage_percent > 85
+        for: 10m
+        labels:
+          severity: warning
+          component: system
+        annotations:
+          summary: 'High memory usage on {{ $labels.job }}'
+          description: 'Memory usage is {{ $value | humanize }}%'
+
+      - alert: CriticalMemoryUsage
+        expr: |
+          memory_usage_percent > 95
+        for: 5m
+        labels:
+          severity: critical
+          component: system
+        annotations:
+          summary: 'Critical memory usage on {{ $labels.job }}'
+          description: 'Memory usage is {{ $value | humanize }}%'
+
+      - alert: HighCpuUsage
+        expr: |
+          cpu_usage_percent > 80
+        for: 10m
+        labels:
+          severity: warning
+          component: system
+        annotations:
+          summary: 'High CPU usage on {{ $labels.job }}'
+          description: 'CPU usage is {{ $value | humanize }}%'
+
+      - alert: EventLoopLagHigh
+        expr: |
+          event_loop_lag_ms > 100
+        for: 5m
+        labels:
+          severity: warning
+          component: system
+        annotations:
+          summary: 'High event loop lag on {{ $labels.job }}'
+          description: 'Event loop lag is {{ $value | humanize }}ms'
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # User & Authentication Alerts
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: user_alerts
+    interval: 1m
+    rules:
+      - alert: HighAuthenticationFailureRate
+        expr: |
+          increase(user_auth_failures_total[5m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+          component: auth
+        annotations:
+          summary: 'High rate of user authentication failures'
+          description: '{{ $value | humanize }} auth failures in the last 5 minutes'
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Service Health Alerts
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: health_alerts
+    interval: 1m
+    rules:
+      - alert: ServiceDown
+        expr: |
+          up{job=~"bankerchanger-.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: service
+        annotations:
+          summary: 'Service {{ $labels.job }} is down'
+          description: 'Service has been unreachable for 2+ minutes'
+
+      - alert: ScrapingErrors
+        expr: |
+          increase(scrape_duration_seconds{job=~"bankerchanger-.*"}[5m]) > 5
+        for: 5m
+        labels:
+          severity: warning
+          component: monitoring
+        annotations:
+          summary: 'Metrics scraping errors for {{ $labels.job }}'
+          description: 'Failed to scrape metrics multiple times'
