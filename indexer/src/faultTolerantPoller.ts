@@ -2,6 +2,7 @@ import { rpc, scValToNative, Contract } from "@stellar/stellar-sdk";
 import { getCursor, saveCursor, upsertInvoice } from "./db";
 import { updateLastLedger } from "./health";
 import { logger } from "./logger";
+import { getCircuitBreaker, CircuitBreakerError } from "./circuitBreaker";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -37,6 +38,14 @@ const BASE_BACKOFF_MS = parseInt(process.env.BASE_BACKOFF_MS || "1000", 10);
 const MAX_BACKOFF_MS = parseInt(process.env.MAX_BACKOFF_MS || "300000", 10);
 const BATCH_SIZE = parseInt(process.env.EVENT_BATCH_SIZE || "50", 10);
 
+// ── Circuit breakers ──────────────────────────────────────────────────────────
+// Shared with the main poller via the named-singleton registry.
+const ftRpcCb = getCircuitBreaker('indexer-rpc-poll', {
+  failureThreshold: 5,
+  resetTimeoutMs: 30_000,
+  callTimeoutMs: 20_000,
+});
+
 // ─── Re-org Detection ────────────────────────────────────────────────────────
 
 export async function detectReorg(
@@ -46,7 +55,7 @@ export async function detectReorg(
   try {
     const ledgerHistory = await Promise.all(
       Array.from({ length: REORG_DETECTION_DEPTH }, (_, i) =>
-        server.getLedger(currentLedger - i).catch(() => null),
+        ftRpcCb.execute(() => server.getLedger(currentLedger - i)).catch(() => null),
       ),
     );
 
@@ -89,7 +98,7 @@ export async function recoverMissingSequences(
     logger.info({ sequence }, "Recovering missing ledger sequence");
 
     try {
-      const ledger = await server.getLedger(sequence);
+      await ftRpcCb.execute(() => server.getLedger(sequence));
       const events = await fetchEventsForLedger(server, sequence);
 
       for (const event of events) {
@@ -116,11 +125,13 @@ async function fetchEventsForLedger(
   const events: ContractEvent[] = [];
 
   try {
-    const response = await server.getEvents({
-      startLedger: ledgerSequence,
-      endLedger: ledgerSequence,
-      limit: 100,
-    });
+    const response = await ftRpcCb.execute(() =>
+      server.getEvents({
+        startLedger: ledgerSequence,
+        endLedger: ledgerSequence,
+        limit: 100,
+      } as any),
+    );
 
     for (const event of response.events) {
       const parsed = parseContractEvent(event, ledgerSequence);
@@ -269,6 +280,15 @@ export async function pollWithFaultTolerance(
   let attempt = 0;
 
   while (attempt < MAX_RETRY_ATTEMPTS) {
+    // Fail fast when the circuit is OPEN — let the caller apply its own backoff.
+    if (ftRpcCb.getState() === 'OPEN') {
+      logger.warn(
+        { breaker: ftRpcCb.name, state: ftRpcCb.getState() },
+        'Circuit breaker is OPEN — skipping fault-tolerant poll',
+      );
+      throw new CircuitBreakerError(ftRpcCb.name, ftRpcCb.getState());
+    }
+
     try {
       // Check for re-orgs
       const reorg = await detectReorg(server, currentLedger);
@@ -292,20 +312,23 @@ export async function pollWithFaultTolerance(
       await updateLastLedger(currentLedger);
 
       return currentLedger + 1;
-    } catch (error: any) {
+    } catch (err: any) {
+      // Don't retry on a circuit breaker rejection; propagate immediately.
+      if (err instanceof CircuitBreakerError) throw err;
+
       attempt++;
-      const isRpcError = error?.message?.includes("rpc") || error?.status === 429;
+      const isRpcError = err?.message?.includes("rpc") || err?.status === 429;
 
       if (isRpcError) {
         const backoffMs = calculateBackoff(attempt);
         logger.warn(
-          { err: error, attempt, backoffMs },
+          { err, attempt, backoffMs },
           "RPC error, retrying with backoff",
         );
         await new Promise((resolve) => setTimeout(resolve, backoffMs));
       } else {
-        logger.error({ err: error, attempt }, "Non-RPC error during polling");
-        throw error;
+        logger.error({ err, attempt }, "Non-RPC error during polling");
+        throw err;
       }
     }
   }

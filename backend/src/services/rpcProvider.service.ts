@@ -11,6 +11,7 @@
 import { rpc } from '@stellar/stellar-sdk';
 import { pool } from '../config/db';
 import { logger } from '../utils/logger';
+import { getCircuitBreaker, CircuitBreakerError } from '../utils/circuitBreaker';
 
 export interface RpcProvider {
   url: string;
@@ -51,6 +52,20 @@ export interface ProviderMetrics {
 const HEALTH_CHECK_INTERVAL_MS = 30 * 1000; // 30 seconds
 const FAILURE_THRESHOLD = 3; // Mark unhealthy after 3 consecutive failures
 const RECOVERY_CHECK_INTERVAL_MS = 5 * 60 * 1000; // Try to recover every 5 minutes
+
+// Circuit breaker options for the RPC provider service.
+// One per named provider URL is too granular here; we use a single breaker
+// for the health-check path and one for `executeWithFailover` user-facing calls.
+const RPC_PROVIDER_CB_OPTIONS = {
+  failureThreshold: 5,
+  resetTimeoutMs: 30_000,
+  callTimeoutMs: 20_000,
+};
+const RPC_HEALTH_CHECK_CB_OPTIONS = {
+  failureThreshold: 10,  // tolerate more failures before suppressing health checks
+  resetTimeoutMs: 60_000,
+  callTimeoutMs: 10_000,
+};
 
 /**
  * Initialize RPC providers from environment variables
@@ -316,15 +331,23 @@ export async function performHealthCheck(): Promise<void> {
       `SELECT provider_url, provider_name FROM rpc_provider_health`
     );
 
+    const healthCb = getCircuitBreaker('rpc-provider-health-check', RPC_HEALTH_CHECK_CB_OPTIONS);
+
     for (const row of rows) {
       const startTime = Date.now();
       try {
         const server = new rpc.Server(row.provider_url);
-        await server.getLatestLedger();
+        await healthCb.execute(() => server.getLatestLedger());
         const responseTime = Date.now() - startTime;
 
         await recordSuccess(row.provider_url, responseTime);
       } catch (err) {
+        if (err instanceof CircuitBreakerError) {
+          logger.warn(
+            { providerUrl: row.provider_url, state: err.state },
+            'RPC health check skipped — circuit breaker is open',
+          );
+        }
         await recordFailure(row.provider_url, err as Error);
       }
     }
@@ -334,12 +357,15 @@ export async function performHealthCheck(): Promise<void> {
 }
 
 /**
- * Create a wrapper around RPC calls that handles failover
+ * Create a wrapper around RPC calls that handles failover and circuit breaking.
+ * The circuit breaker opens after 5 consecutive total failures across all
+ * providers, preventing cascading load on already-failing endpoints.
  */
 export async function executeWithFailover<T>(
   operation: (provider: RpcProvider) => Promise<T>,
   maxRetries: number = 3
 ): Promise<T> {
+  const cb = getCircuitBreaker('rpc-provider-execute', RPC_PROVIDER_CB_OPTIONS);
   let lastError: Error | null = null;
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -348,14 +374,14 @@ export async function executeWithFailover<T>(
       const startTime = Date.now();
 
       try {
-        const result = await operation(provider);
+        const result = await cb.execute(() => operation(provider));
         await recordSuccess(provider.url, Date.now() - startTime);
         return result;
       } catch (err) {
-        const responseTime = Date.now() - startTime;
-        await recordFailure(provider.url, err as Error);
+        // CircuitBreakerError means the breaker is open — stop retrying.
+        if (err instanceof CircuitBreakerError) throw err;
 
-        // Mark as failed so next attempt uses different provider
+        await recordFailure(provider.url, err as Error);
         lastError = err as Error;
 
         // Wait a bit before retry
@@ -364,6 +390,7 @@ export async function executeWithFailover<T>(
         }
       }
     } catch (err) {
+      if (err instanceof CircuitBreakerError) throw err;
       lastError = err as Error;
     }
   }
@@ -441,10 +468,11 @@ export async function addProvider(
   weight: number = 1
 ): Promise<void> {
   try {
-    // Verify the provider is reachable
+    // Verify the provider is reachable before registering it
     const startTime = Date.now();
     const server = new rpc.Server(url);
-    await server.getLatestLedger();
+    const verifyCb = getCircuitBreaker('rpc-provider-execute', RPC_PROVIDER_CB_OPTIONS);
+    await verifyCb.execute(() => server.getLatestLedger());
     const responseTime = Date.now() - startTime;
 
     await pool.query(

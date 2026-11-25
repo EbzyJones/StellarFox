@@ -11,9 +11,26 @@ import {
   PagerDutyEventAction,
   PagerDutyIncident,
 } from '../types/alerting.types';
+import { getCircuitBreaker } from '../utils/circuitBreaker';
 
 const PAGERDUTY_API_BASE = 'https://api.pagerduty.com';
 const PAGERDUTY_EVENTS_API = 'https://events.pagerduty.com/v2/enqueue';
+
+// Circuit breakers for PagerDuty API calls.
+// Two separate breakers: one for the Events API (high-frequency: trigger/ack/resolve)
+// and one for the REST API (lower-frequency management operations).
+// They are named singletons so the state is shared across all PagerDutyService
+// instances in the same process.
+const PD_EVENTS_CB_OPTIONS = {
+  failureThreshold: 5,
+  resetTimeoutMs: 60_000, // wait a full minute before probing PagerDuty again
+  callTimeoutMs: 10_000,
+};
+const PD_API_CB_OPTIONS = {
+  failureThreshold: 3,
+  resetTimeoutMs: 120_000,
+  callTimeoutMs: 15_000,
+};
 
 export class PagerDutyService {
   private apiClient: AxiosInstance;
@@ -97,7 +114,8 @@ export class PagerDutyService {
         client_url: process.env.DASHBOARD_URL || 'https://app.stellarfox.dev',
       };
 
-      const response = await this.eventsClient.post('/', event);
+      const cb = getCircuitBreaker('pagerduty-events', PD_EVENTS_CB_OPTIONS);
+      const response = await cb.execute(() => this.eventsClient.post('/', event));
 
       logger.info('Incident triggered in PagerDuty', {
         eventId: response.data.id,
@@ -137,7 +155,8 @@ export class PagerDutyService {
         },
       };
 
-      const response = await this.eventsClient.post('/', event);
+      const cb = getCircuitBreaker('pagerduty-events', PD_EVENTS_CB_OPTIONS);
+      const response = await cb.execute(() => this.eventsClient.post('/', event));
 
       logger.info('Incident acknowledged in PagerDuty', {
         dedupKey,
@@ -177,7 +196,8 @@ export class PagerDutyService {
         },
       };
 
-      const response = await this.eventsClient.post('/', event);
+      const cb = getCircuitBreaker('pagerduty-events', PD_EVENTS_CB_OPTIONS);
+      const response = await cb.execute(() => this.eventsClient.post('/', event));
 
       logger.info('Incident resolved in PagerDuty', {
         dedupKey,
@@ -199,7 +219,8 @@ export class PagerDutyService {
    */
   async getIncident(incidentId: string): Promise<PagerDutyIncident> {
     try {
-      const response = await this.apiClient.get(`/incidents/${incidentId}`);
+      const cb = getCircuitBreaker('pagerduty-api', PD_API_CB_OPTIONS);
+      const response = await cb.execute(() => this.apiClient.get(`/incidents/${incidentId}`));
       return response.data.incident;
     } catch (error) {
       logger.error('Failed to fetch incident from PagerDuty', { error, incidentId });
@@ -239,7 +260,8 @@ export class PagerDutyService {
         params.urgencies = filters.urgencies.join(',');
       }
 
-      const response = await this.apiClient.get('/incidents', { params });
+      const cb = getCircuitBreaker('pagerduty-api', PD_API_CB_OPTIONS);
+      const response = await cb.execute(() => this.apiClient.get('/incidents', { params }));
 
       return {
         incidents: response.data.incidents,
@@ -258,11 +280,12 @@ export class PagerDutyService {
    */
   async getOnCallUsers(serviceId: string): Promise<Array<{ id: string; email: string; name: string }>> {
     try {
-      const response = await this.apiClient.get(`/services/${serviceId}/integrations`, {
-        params: {
-          include: 'schedule',
-        },
-      });
+      const cb = getCircuitBreaker('pagerduty-api', PD_API_CB_OPTIONS);
+      const response = await cb.execute(() =>
+        this.apiClient.get(`/services/${serviceId}/integrations`, {
+          params: { include: 'schedule' },
+        }),
+      );
 
       // Get schedule ID from integrations
       const scheduleId = response.data.integrations?.[0]?.schedule?.id;
@@ -272,11 +295,11 @@ export class PagerDutyService {
       }
 
       // Get on-call users from schedule
-      const scheduleResponse = await this.apiClient.get(`/schedules/${scheduleId}/users`, {
-        params: {
-          'include[]': 'contact_methods',
-        },
-      });
+      const scheduleResponse = await cb.execute(() =>
+        this.apiClient.get(`/schedules/${scheduleId}/users`, {
+          params: { 'include[]': 'contact_methods' },
+        }),
+      );
 
       return scheduleResponse.data.users.map((user: any) => ({
         id: user.id,
@@ -294,11 +317,12 @@ export class PagerDutyService {
    */
   async getEscalationPolicy(policyId: string): Promise<any> {
     try {
-      const response = await this.apiClient.get(`/escalation_policies/${policyId}`, {
-        params: {
-          'include[]': 'escalation_rules',
-        },
-      });
+      const cb = getCircuitBreaker('pagerduty-api', PD_API_CB_OPTIONS);
+      const response = await cb.execute(() =>
+        this.apiClient.get(`/escalation_policies/${policyId}`, {
+          params: { 'include[]': 'escalation_rules' },
+        }),
+      );
 
       return response.data.escalation_policy;
     } catch (error) {
@@ -312,9 +336,10 @@ export class PagerDutyService {
    */
   async updateIncident(incidentId: string, updates: Record<string, any>): Promise<PagerDutyIncident> {
     try {
-      const response = await this.apiClient.put(`/incidents/${incidentId}`, {
-        incident: updates,
-      });
+      const cb = getCircuitBreaker('pagerduty-api', PD_API_CB_OPTIONS);
+      const response = await cb.execute(() =>
+        this.apiClient.put(`/incidents/${incidentId}`, { incident: updates }),
+      );
 
       return response.data.incident;
     } catch (error) {
@@ -333,18 +358,21 @@ export class PagerDutyService {
     description: string,
   ): Promise<any> {
     try {
-      const response = await this.apiClient.post('/maintenance_windows', {
-        maintenance_window: {
-          type: 'maintenance_window',
-          start_time: startTime.toISOString(),
-          end_time: endTime.toISOString(),
-          description,
-          services: serviceIds.map((id) => ({
-            id,
-            type: 'service_reference',
-          })),
-        },
-      });
+      const cb = getCircuitBreaker('pagerduty-api', PD_API_CB_OPTIONS);
+      const response = await cb.execute(() =>
+        this.apiClient.post('/maintenance_windows', {
+          maintenance_window: {
+            type: 'maintenance_window',
+            start_time: startTime.toISOString(),
+            end_time: endTime.toISOString(),
+            description,
+            services: serviceIds.map((id) => ({
+              id,
+              type: 'service_reference',
+            })),
+          },
+        }),
+      );
 
       logger.info('Maintenance window created', {
         id: response.data.maintenance_window.id,
@@ -358,7 +386,9 @@ export class PagerDutyService {
   }
 
   /**
-   * Check if PagerDuty integration is healthy
+   * Check if PagerDuty integration is healthy.
+   * Uses the REST API circuit breaker; returns false (not throws) when the
+   * breaker is OPEN so callers can degrade gracefully without propagating errors.
    */
   async healthCheck(): Promise<boolean> {
     try {
@@ -366,7 +396,8 @@ export class PagerDutyService {
         return false;
       }
 
-      await this.apiClient.get('/users', { params: { limit: 1 } });
+      const cb = getCircuitBreaker('pagerduty-api', PD_API_CB_OPTIONS);
+      await cb.execute(() => this.apiClient.get('/users', { params: { limit: 1 } }));
       return true;
     } catch (error) {
       logger.warn('PagerDuty health check failed', { error });
