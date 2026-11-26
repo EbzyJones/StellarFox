@@ -1,26 +1,22 @@
 /**
  * Dynamic Connection Pool Management Service
  *
- * Optimizes connection pool settings based on real-time load patterns,
- * resource availability, and system metrics. Implements auto-scaling,
- * connection queuing, and performance monitoring.
+ * Wraps the shared pg Pool with:
+ *   – Adaptive pool-size recommendations based on real-time load patterns.
+ *   – Per-connection lifecycle hooks that feed the ConnectionPoolMonitor.
+ *   – A monitored `connect()` helper that records wait time and hold time.
+ *
+ * Most metric collection and self-healing logic lives in
+ * connectionPoolMonitor.service.ts; this module bridges the pool usage layer
+ * to that monitor.
  */
 
 import { Pool, PoolClient } from 'pg';
-import * as pino from 'pino';
-
-const logger = pino.default();
-
-export interface PoolMetrics {
-  totalConnections: number;
-  activeConnections: number;
-  idleConnections: number;
-  waitingRequests: number;
-  connectionUtilization: number; // Percentage
-  avgQueryTime: number; // ms
-  connectionErrors: number;
-  lastUpdated: Date;
-}
+import { logger } from '../utils/logger';
+import {
+  getConnectionPoolMonitor,
+  ConnectionPoolMonitor,
+} from './connectionPoolMonitor.service';
 
 export interface PoolConfig {
   max: number;
@@ -31,95 +27,216 @@ export interface PoolConfig {
   statementTimeoutMs: number;
 }
 
+export interface PoolMetrics {
+  totalConnections: number;
+  activeConnections: number;
+  idleConnections: number;
+  waitingRequests: number;
+  connectionUtilization: number;
+  avgQueryTime: number;
+  connectionErrors: number;
+  lastUpdated: Date;
+}
+
 export interface LoadPattern {
   timestamp: Date;
-  requestRate: number; // requests per second
-  avgConnectionDuration: number; // ms
-  connectionErrorRate: number; // percentage
-  cpuUsage: number; // percentage
-  memoryUsage: number; // percentage
+  requestRate: number;
+  avgConnectionDuration: number;
+  connectionErrorRate: number;
+  cpuUsage: number;
+  memoryUsage: number;
+}
+
+// ── Monitored connect helper ──────────────────────────────────────────────────
+
+let _connectionSeq = 0;
+
+function nextConnectionId(): string {
+  return `conn-${process.pid}-${++_connectionSeq}`;
 }
 
 /**
- * Dynamic Pool Manager handles adaptive connection pool sizing
+ * Acquire a client from the pool, recording wait time and hold time via the
+ * ConnectionPoolMonitor.  Returns the client and a `release` function.
+ *
+ * Usage:
+ *   const { client, release } = await acquireMonitoredConnection(pool);
+ *   try {
+ *     await client.query('...');
+ *   } finally {
+ *     release();
+ *   }
+ */
+export async function acquireMonitoredConnection(pool: Pool): Promise<{
+  client: PoolClient;
+  release: (err?: Error) => void;
+}> {
+  let monitor: ConnectionPoolMonitor | undefined;
+  try {
+    monitor = getConnectionPoolMonitor();
+  } catch {
+    // Monitor not initialised — proceed without tracking
+  }
+
+  const id = nextConnectionId();
+  monitor?.onWaitStart(id);
+
+  let client: PoolClient;
+  try {
+    client = await pool.connect();
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    monitor?.onError(id, reason.slice(0, 100));
+    throw err;
+  }
+
+  monitor?.onAcquired(id);
+
+  const release = (err?: Error): void => {
+    if (err) {
+      monitor?.onDestroyed(id, err.message.slice(0, 100));
+      client.release(err);
+    } else {
+      monitor?.onReleased(id);
+      client.release();
+    }
+  };
+
+  return { client, release };
+}
+
+// ── DynamicPoolManager ────────────────────────────────────────────────────────
+
+/**
+ * Tracks load patterns and derives pool-size recommendations.
+ * Does NOT recreate the Pool object (pg does not support dynamic resizing).
+ * Instead it logs recommendations and exposes them via the REST API so an
+ * operator (or future automation) can apply them to the pool config.
  */
 export class DynamicPoolManager {
-  private pool: Pool;
-  private metrics: PoolMetrics;
-  private loadPatterns: LoadPattern[] = [];
+  private readonly pool: Pool;
   private currentConfig: PoolConfig;
-  private configUpdateInterval: NodeJS.Timeout | null = null;
+  private loadPatterns: LoadPattern[] = [];
+  private queryStats = new Map<string, { count: number; totalTime: number }>();
   private metricsInterval: NodeJS.Timeout | null = null;
   private readonly maxPoolSize = 100;
   private readonly minPoolSize = 5;
-  private queryStats: Map<string, { count: number; totalTime: number }> = new Map();
 
-  constructor(initialPool: Pool, initialConfig: PoolConfig) {
-    this.pool = initialPool;
+  constructor(pool: Pool, initialConfig: PoolConfig) {
+    this.pool = pool;
     this.currentConfig = initialConfig;
-    this.metrics = this.initializeMetrics();
   }
 
-  /**
-   * Initialize metrics tracking
-   */
-  private initializeMetrics(): PoolMetrics {
+  /** Start periodic load-pattern recording. */
+  startMonitoring(intervalMs = 30_000): void {
+    if (this.metricsInterval) return;
+    this.metricsInterval = setInterval(async () => {
+      try {
+        this.recordLoadPattern();
+        this.logRecommendations();
+      } catch (err) {
+        logger.error({ err }, 'DynamicPoolManager monitoring tick error');
+      }
+    }, intervalMs);
+    logger.info('DynamicPoolManager load-pattern monitoring started');
+  }
+
+  stopMonitoring(): void {
+    if (this.metricsInterval) {
+      clearInterval(this.metricsInterval);
+      this.metricsInterval = null;
+    }
+  }
+
+  trackQueryExecution(query: string, durationMs: number): void {
+    const key = this.normalizeQuery(query);
+    const existing = this.queryStats.get(key) ?? { count: 0, totalTime: 0 };
+    existing.count++;
+    existing.totalTime += durationMs;
+    this.queryStats.set(key, existing);
+  }
+
+  recordConnectionError(): void {
+    try {
+      getConnectionPoolMonitor().onError('legacy', 'recorded_via_service');
+    } catch {
+      // Monitor not initialised; ignore
+    }
+  }
+
+  getMetrics(): PoolMetrics {
+    const active = this.pool.totalCount - this.pool.idleCount;
     return {
-      totalConnections: this.currentConfig.max,
-      activeConnections: 0,
-      idleConnections: this.currentConfig.max,
-      waitingRequests: 0,
-      connectionUtilization: 0,
-      avgQueryTime: 0,
+      totalConnections: this.pool.totalCount,
+      activeConnections: active,
+      idleConnections: this.pool.idleCount,
+      waitingRequests: this.pool.waitingCount,
+      connectionUtilization: this.currentConfig.max > 0
+        ? (active / this.currentConfig.max) * 100
+        : 0,
+      avgQueryTime: this.computeAvgQueryTime(),
       connectionErrors: 0,
       lastUpdated: new Date(),
     };
   }
 
-  /**
-   * Start monitoring and auto-adjusting the pool
-   */
-  public startMonitoring(intervalMs: number = 30000): void {
-    if (this.metricsInterval) {
-      clearInterval(this.metricsInterval);
-    }
-
-    this.metricsInterval = setInterval(async () => {
-      try {
-        await this.updateMetrics();
-        await this.adjustPoolSize();
-      } catch (error) {
-        logger.error({ error }, 'Error updating pool metrics');
-      }
-    }, intervalMs);
-
-    logger.info('Connection pool monitoring started');
+  getConfiguration(): PoolConfig {
+    return { ...this.currentConfig };
   }
 
-  /**
-   * Stop monitoring
-   */
-  public stopMonitoring(): void {
-    if (this.metricsInterval) {
-      clearInterval(this.metricsInterval);
-      this.metricsInterval = null;
-    }
-    if (this.configUpdateInterval) {
-      clearInterval(this.configUpdateInterval);
-      this.configUpdateInterval = null;
+  getLoadPatterns(): LoadPattern[] {
+    return [...this.loadPatterns];
+  }
+
+  getHealthStatus(): { healthy: boolean; issues: string[] } {
+    try {
+      const summary = getConnectionPoolMonitor().healthSummary();
+      return { healthy: summary.status === 'healthy', issues: summary.issues };
+    } catch {
+      // Fall back to basic check
+      const metrics = this.getMetrics();
+      const issues: string[] = [];
+      if (metrics.connectionUtilization > 95) issues.push('Pool nearly exhausted');
+      if (metrics.waitingRequests > 10) issues.push('High waiting requests');
+      return { healthy: issues.length === 0, issues };
     }
   }
 
-  /**
-   * Update current metrics from pool and system
-   */
-  private async updateMetrics(): Promise<void> {
-    const poolState = (this.pool as any)._clients || [];
-    const activeConnections = poolState.length - (this.pool as any)._idle?.length || 0;
-    const idleConnections = (this.pool as any)._idle?.length || 0;
-    const waitingRequests = (this.pool as any)._queue?.length || 0;
+  generatePerformanceReport(): {
+    currentMetrics: PoolMetrics;
+    configuration: PoolConfig;
+    healthStatus: { healthy: boolean; issues: string[] };
+    recommendations: string[];
+  } {
+    const recommendations: string[] = [];
+    const metrics = this.getMetrics();
 
-    // Calculate average query time
+    if (metrics.connectionUtilization > 80) {
+      recommendations.push(
+        `Increase DB_POOL_MAX beyond current ${this.currentConfig.max}`,
+      );
+    }
+    if (metrics.avgQueryTime > 2000) {
+      recommendations.push('Review slow queries and add missing indexes');
+    }
+
+    const recent = this.loadPatterns[this.loadPatterns.length - 1];
+    if (recent) {
+      if (recent.cpuUsage > 80) recommendations.push('High CPU — consider horizontal scaling');
+      if (recent.memoryUsage > 80) recommendations.push('High memory — review query result sizes');
+    }
+
+    return {
+      currentMetrics: metrics,
+      configuration: this.getConfiguration(),
+      healthStatus: this.getHealthStatus(),
+      recommendations,
+    };
+  }
+
+  // ── Internal ───────────────────────────────────────────────────────────────
+
+  private recordLoadPattern(): void {
     let totalQueryTime = 0;
     let totalQueries = 0;
     this.queryStats.forEach(({ count, totalTime }) => {
@@ -127,289 +244,104 @@ export class DynamicPoolManager {
       totalQueryTime += totalTime;
     });
 
-    const avgQueryTime = totalQueries > 0 ? totalQueryTime / totalQueries : 0;
-
-    this.metrics = {
-      totalConnections: this.currentConfig.max,
-      activeConnections,
-      idleConnections,
-      waitingRequests,
-      connectionUtilization: (activeConnections / this.currentConfig.max) * 100,
-      avgQueryTime,
-      connectionErrors: this.metrics.connectionErrors,
-      lastUpdated: new Date(),
-    };
-
-    // Record load pattern
-    const loadPattern: LoadPattern = {
+    const pattern: LoadPattern = {
       timestamp: new Date(),
-      requestRate: totalQueries / 30, // Approximate RPS over 30s interval
-      avgConnectionDuration: avgQueryTime,
-      connectionErrorRate: 0, // Would calculate from connection errors
-      cpuUsage: await this.getSystemCPUUsage(),
-      memoryUsage: await this.getSystemMemoryUsage(),
+      requestRate: totalQueries / 30,
+      avgConnectionDuration: totalQueries > 0 ? totalQueryTime / totalQueries : 0,
+      connectionErrorRate: 0,
+      cpuUsage: this.getCPUUsage(),
+      memoryUsage: this.getMemoryUsage(),
     };
 
-    this.loadPatterns.push(loadPattern);
-    if (this.loadPatterns.length > 100) {
-      this.loadPatterns.shift();
-    }
-
-    logger.debug(
-      {
-        active: activeConnections,
-        idle: idleConnections,
-        waiting: waitingRequests,
-        utilization: this.metrics.connectionUtilization.toFixed(2) + '%',
-      },
-      'Pool metrics updated',
-    );
+    this.loadPatterns.push(pattern);
+    if (this.loadPatterns.length > 100) this.loadPatterns.shift();
   }
 
-  /**
-   * Automatically adjust pool size based on load
-   */
-  private async adjustPoolSize(): Promise<void> {
-    const { connectionUtilization, activeConnections, waitingRequests } = this.metrics;
-    const newConfig = { ...this.currentConfig };
-    let adjusted = false;
-
-    // Scale up if utilization is high
-    if (connectionUtilization > 80 && this.currentConfig.max < this.maxPoolSize) {
-      const increase = Math.min(
-        Math.ceil(this.currentConfig.max * 0.2),
-        this.maxPoolSize - this.currentConfig.max,
+  private logRecommendations(): void {
+    const metrics = this.getMetrics();
+    if (metrics.connectionUtilization > 80 && this.currentConfig.max < this.maxPoolSize) {
+      const recommended = Math.min(
+        Math.ceil(this.currentConfig.max * 1.2),
+        this.maxPoolSize,
       );
-      newConfig.max = this.currentConfig.max + increase;
-      adjusted = true;
       logger.info(
-        `Scaling up pool: ${this.currentConfig.max} → ${newConfig.max} connections`,
+        { current: this.currentConfig.max, recommended },
+        'DynamicPoolManager: recommend increasing DB_POOL_MAX',
       );
     }
-
-    // Scale down if utilization is low
-    if (connectionUtilization < 30 && this.currentConfig.max > this.minPoolSize) {
-      const decrease = Math.max(
-        Math.floor(this.currentConfig.max * 0.1),
-        this.minPoolSize - this.currentConfig.max,
+    if (metrics.connectionUtilization < 30 && this.currentConfig.max > this.minPoolSize) {
+      const recommended = Math.max(
+        Math.floor(this.currentConfig.max * 0.9),
+        this.minPoolSize,
       );
-      newConfig.max = Math.max(this.currentConfig.max - decrease, this.minPoolSize);
-      adjusted = true;
       logger.info(
-        `Scaling down pool: ${this.currentConfig.max} → ${newConfig.max} connections`,
+        { current: this.currentConfig.max, recommended },
+        'DynamicPoolManager: recommend decreasing DB_POOL_MAX',
       );
     }
-
-    // Optimize timeout based on query times
-    const avgQueryTime = this.metrics.avgQueryTime;
-    if (avgQueryTime > 0) {
-      const recommendedTimeout = Math.ceil(avgQueryTime * 3); // 3x average + safety margin
-      if (Math.abs(recommendedTimeout - this.currentConfig.maxQueryTimeMs) > 100) {
-        newConfig.maxQueryTimeMs = recommendedTimeout;
-        adjusted = true;
-      }
-    }
-
-    if (adjusted) {
-      this.currentConfig = newConfig;
-      await this.applyConfiguration();
-    }
   }
 
-  /**
-   * Apply configuration changes to the pool
-   */
-  private async applyConfiguration(): Promise<void> {
-    // Note: pg Pool doesn't support dynamic resizing directly
-    // This would need to be implemented by creating a new pool
-    // or through custom wrapper logic
-    logger.info(
-      {
-        max: this.currentConfig.max,
-        idleTimeout: this.currentConfig.idleTimeoutMillis,
-        connectionTimeout: this.currentConfig.connectionTimeoutMillis,
-      },
-      'New pool configuration',
-    );
+  private computeAvgQueryTime(): number {
+    let total = 0;
+    let count = 0;
+    this.queryStats.forEach(({ count: c, totalTime }) => {
+      count += c;
+      total += totalTime;
+    });
+    return count > 0 ? total / count : 0;
   }
 
-  /**
-   * Get current pool metrics
-   */
-  public getMetrics(): PoolMetrics {
-    return { ...this.metrics };
-  }
-
-  /**
-   * Get current configuration
-   */
-  public getConfiguration(): PoolConfig {
-    return { ...this.currentConfig };
-  }
-
-  /**
-   * Get load patterns history
-   */
-  public getLoadPatterns(): LoadPattern[] {
-    return [...this.loadPatterns];
-  }
-
-  /**
-   * Track query execution time
-   */
-  public trackQueryExecution(query: string, durationMs: number): void {
-    const normalized = this.normalizeQuery(query);
-    const existing = this.queryStats.get(normalized) || { count: 0, totalTime: 0 };
-    existing.count++;
-    existing.totalTime += durationMs;
-    this.queryStats.set(normalized, existing);
-  }
-
-  /**
-   * Record connection error
-   */
-  public recordConnectionError(): void {
-    this.metrics.connectionErrors++;
-  }
-
-  /**
-   * Normalize query for tracking (remove literals)
-   */
   private normalizeQuery(query: string): string {
     return query
-      .replace(/\$\d+/g, '$X') // Replace parameter placeholders
-      .replace(/'[^']*'/g, "'?'") // Replace string literals
-      .replace(/\d+/g, 'N'); // Replace numbers
+      .replace(/\$\d+/g, '$X')
+      .replace(/'[^']*'/g, "'?'")
+      .replace(/\d+/g, 'N');
   }
 
-  /**
-   * Get system CPU usage (percentage)
-   */
-  private async getSystemCPUUsage(): Promise<number> {
+  private getCPUUsage(): number {
     try {
-      const os = require('os');
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const os = require('os') as typeof import('os');
       const cpus = os.cpus();
       let idle = 0;
       let total = 0;
-
-      cpus.forEach((cpu: any) => {
-        for (const type in cpu.times) {
+      for (const cpu of cpus) {
+        for (const type of Object.keys(cpu.times) as (keyof typeof cpu.times)[]) {
           total += cpu.times[type];
         }
         idle += cpu.times.idle;
-      });
-
-      return Math.round(((total - idle) / total) * 100) || 0;
+      }
+      return total > 0 ? Math.round(((total - idle) / total) * 100) : 0;
     } catch {
       return 0;
     }
   }
 
-  /**
-   * Get system memory usage (percentage)
-   */
-  private async getSystemMemoryUsage(): Promise<number> {
+  private getMemoryUsage(): number {
     try {
-      const os = require('os');
-      const totalMem = os.totalmem();
-      const freeMem = os.freemem();
-      return Math.round(((totalMem - freeMem) / totalMem) * 100);
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const os = require('os') as typeof import('os');
+      return Math.round(((os.totalmem() - os.freemem()) / os.totalmem()) * 100);
     } catch {
       return 0;
     }
-  }
-
-  /**
-   * Get health status
-   */
-  public getHealthStatus(): {
-    healthy: boolean;
-    issues: string[];
-  } {
-    const issues: string[] = [];
-
-    if (this.metrics.connectionUtilization > 95) {
-      issues.push('Pool nearly exhausted');
-    }
-
-    if (this.metrics.waitingRequests > 10) {
-      issues.push('High number of waiting requests');
-    }
-
-    if (this.metrics.connectionErrors > 10) {
-      issues.push('Connection errors detected');
-    }
-
-    if (this.metrics.avgQueryTime > 5000) {
-      issues.push('High average query time');
-    }
-
-    return {
-      healthy: issues.length === 0,
-      issues,
-    };
-  }
-
-  /**
-   * Generate performance report
-   */
-  public generatePerformanceReport(): {
-    currentMetrics: PoolMetrics;
-    configuration: PoolConfig;
-    healthStatus: { healthy: boolean; issues: string[] };
-    recommendations: string[];
-  } {
-    const health = this.getHealthStatus();
-    const recommendations: string[] = [];
-
-    if (this.metrics.connectionUtilization > 80) {
-      recommendations.push('Consider increasing max_connections');
-    }
-
-    if (this.metrics.avgQueryTime > 2000) {
-      recommendations.push('Review slow queries and add indexes');
-    }
-
-    if (this.loadPatterns.length > 0) {
-      const recentPattern = this.loadPatterns[this.loadPatterns.length - 1];
-      if (recentPattern.cpuUsage > 80) {
-        recommendations.push('System CPU usage is high, consider scaling');
-      }
-      if (recentPattern.memoryUsage > 80) {
-        recommendations.push('System memory usage is high, consider optimization');
-      }
-    }
-
-    return {
-      currentMetrics: this.getMetrics(),
-      configuration: this.getConfiguration(),
-      healthStatus: health,
-      recommendations,
-    };
   }
 }
 
-/**
- * Create and initialize a dynamic pool manager
- */
+// ── Singleton factory ─────────────────────────────────────────────────────────
+
+let _manager: DynamicPoolManager | null = null;
+
 export function createDynamicPoolManager(pool: Pool, config: PoolConfig): DynamicPoolManager {
   return new DynamicPoolManager(pool, config);
 }
 
-/**
- * Export singleton instance
- */
-let dynamicPoolManagerInstance: DynamicPoolManager | null = null;
-
-export function initializeDynamicPoolManager(
-  pool: Pool,
-  config: PoolConfig,
-): DynamicPoolManager {
-  dynamicPoolManagerInstance = createDynamicPoolManager(pool, config);
-  dynamicPoolManagerInstance.startMonitoring(30000); // Update every 30 seconds
-  return dynamicPoolManagerInstance;
+export function initializeDynamicPoolManager(pool: Pool, config: PoolConfig): DynamicPoolManager {
+  _manager = createDynamicPoolManager(pool, config);
+  _manager.startMonitoring(30_000);
+  return _manager;
 }
 
 export function getDynamicPoolManager(): DynamicPoolManager | null {
-  return dynamicPoolManagerInstance;
+  return _manager;
 }
