@@ -30,6 +30,10 @@ export class AppError extends Error {
     return new AppError(409, message, code, details);
   }
 
+  static tooManyRequests(message: string = 'Too many requests', code?: string, details?: unknown): AppError {
+    return new AppError(429, message, code, details);
+  }
+
   static internalError(message: string = 'Internal server error', code?: string, details?: unknown): AppError {
     return new AppError(500, message, code, details);
   }
