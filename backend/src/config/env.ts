@@ -55,6 +55,35 @@ const envSchema = z.object({
   DLQ_ENABLED: z.coerce.boolean().default(true),
   DLQ_MAX_RETRIES: z.coerce.number().int().positive().default(5),
   SCHEMA_VALIDATION_ENABLED: z.coerce.boolean().default(true),
+
+  // ── Async Job Queue (BullMQ over Redis) ─────────────────────────────────────
+  // Disabled lets the backend run without the queue subsystem (e.g. lightweight
+  // instances, tests). When disabled, enqueue() throws and workers are not started.
+  JOB_QUEUE_ENABLED: z.coerce.boolean().default(true),
+  // Per-worker concurrency: how many jobs one Worker instance processes in parallel.
+  JOB_QUEUE_CONCURRENCY: z.coerce.number().int().positive().max(64).default(4),
+  // Default retry attempts for jobs that do not override it. 0 = no retries.
+  JOB_QUEUE_MAX_RETRIES: z.coerce.number().int().min(0).default(3),
+  // Base delay for exponential backoff between retries (ms).
+  JOB_QUEUE_BACKOFF_MS: z.coerce.number().int().positive().default(2000),
+  // Keep at most N completed / failed jobs per queue for inspection; older ones are
+  // pruned automatically by BullMQ. 0 keeps none beyond the active set.
+  JOB_QUEUE_REMOVE_ON_COMPLETE: z.coerce.number().int().min(0).default(100),
+  JOB_QUEUE_REMOVE_ON_FAIL: z.coerce.number().int().min(0).default(500),
+  // Stalled-job watchdog: how often BullMQ scans for workers that died mid-job, and
+  // how many times a job may stall before being marked permanently failed.
+  JOB_QUEUE_STALLED_INTERVAL_MS: z.coerce.number().int().positive().default(30_000),
+  JOB_QUEUE_MAX_STALLED_COUNT: z.coerce.number().int().positive().default(1),
+  // Optional rate limit: max jobs a worker will *start* per second for a queue
+  // (BullMQ `limiter.max` with duration 1000ms). 0 disables the limiter.
+  JOB_QUEUE_MAX_ACTIVE: z.coerce.number().int().min(0).default(0),
+  // Expose queue Prometheus metrics at /metrics.
+  JOB_QUEUE_METRICS_ENABLED: z.coerce.boolean().default(true),
+  // Enable BullMQ-backed scheduled (repeatable) jobs. Defaults to false because the
+  // same tasks currently run via node-cron (cron/*.cron.ts); enabling this without
+  // disabling the matching node-cron jobs would run them twice. See queue/README.md
+  // for the migration path.
+  JOB_QUEUE_SCHEDULER_ENABLED: z.coerce.boolean().default(false),
 });
 
 export type Env = z.infer<typeof envSchema>;

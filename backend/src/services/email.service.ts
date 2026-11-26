@@ -130,6 +130,28 @@ export async function sendEmail(
   }
 }
 
+/**
+ * Strict variant of sendEmail used by the job queue.
+ * Same behaviour as sendEmail, but rethrows delivery errors so the queue can
+ * retry transient SMTP failures instead of silently dropping the message.
+ * Returns the transport's messageId on success.
+ */
+export async function sendEmailStrict(
+  to: string,
+  template: EmailTemplate,
+  data: Record<string, string>,
+): Promise<{ messageId: string }> {
+  const mergedData = { appName: APP_NAME, ...data };
+  const html = renderTemplate(template, mergedData);
+  const info = await transporter.sendMail({
+    from: `"${APP_NAME}" <${FROM_ADDRESS}>`,
+    to,
+    subject: SUBJECTS[template],
+    html,
+  });
+  return { messageId: info.messageId };
+}
+
 // ---------------------------------------------------------------------------
 // Convenience wrappers (preserve existing call sites)
 // ---------------------------------------------------------------------------
