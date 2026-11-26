@@ -1,20 +1,98 @@
 /**
- * Event processing metrics tracker
+ * Event processing metrics tracker with Prometheus integration
  * 
  * Tracks:
  * - Latency: Time to process individual events and batches
  * - Throughput: Events processed per second, batches processed per minute
  * - Error rates: Failed events, failed batches, error percentages
  * - Queue depth: Number of pending events to process
+ * 
+ * Exports metrics in both JSON and Prometheus text format for compatibility
+ * with monitoring systems.
  */
+
+import { 
+  Counter, 
+  Histogram, 
+  Gauge, 
+  register as promRegister,
+  collectDefaultMetrics,
+} from 'prom-client';
+
+// Collect default Node.js metrics
+collectDefaultMetrics({ register: promRegister });
+
+// ════════════════════════════════════════════════════════════════════════════
+// ── Prometheus Metrics ────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+
+/** Counter for successful event processing. */
+const indexerEventsProcessedSuccess = new Counter({
+  name: 'indexer_events_processed_success_total',
+  help: 'Total number of successfully processed events',
+});
+
+/** Counter for failed event processing. */
+const indexerEventsProcessedFailure = new Counter({
+  name: 'indexer_events_processed_failure_total',
+  help: 'Total number of failed events',
+});
+
+/** Histogram for event processing latency. */
+const indexerEventProcessingLatency = new Histogram({
+  name: 'indexer_event_processing_latency_ms',
+  help: 'Event processing latency in milliseconds',
+  buckets: [1, 5, 10, 25, 50, 100, 250, 500, 1000],
+});
+
+/** Counter for successful batch processing. */
+const indexerBatchesProcessedSuccess = new Counter({
+  name: 'indexer_batches_processed_success_total',
+  help: 'Total number of successfully processed batches',
+});
+
+/** Counter for failed batch processing. */
+const indexerBatchesProcessedFailure = new Counter({
+  name: 'indexer_batches_processed_failure_total',
+  help: 'Total number of failed batches',
+});
+
+/** Histogram for batch processing latency. */
+const indexerBatchProcessingLatency = new Histogram({
+  name: 'indexer_batch_processing_latency_ms',
+  help: 'Batch processing latency in milliseconds',
+  buckets: [10, 50, 100, 250, 500, 1000, 2500, 5000],
+});
+
+/** Gauge for queue depth (pending events). */
+const indexerQueueDepth = new Gauge({
+  name: 'indexer_queue_depth',
+  help: 'Number of events pending processing in the queue',
+});
+
+/** Gauge for throughput (events per second). */
+const indexerThroughputEventsPerSecond = new Gauge({
+  name: 'indexer_throughput_events_per_second',
+  help: 'Events processed per second',
+});
+
+/** Gauge for batch throughput (batches per minute). */
+const indexerThroughputBatchesPerMinute = new Gauge({
+  name: 'indexer_throughput_batches_per_minute',
+  help: 'Batches processed per minute',
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// ── Internal Metrics State ────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
 
 interface EventMetrics {
   totalEvents: number;
   failedEvents: number;
-  totalLatencyMs: number; // Cumulative latency for averaging
+  totalLatencyMs: number;
   minLatencyMs: number;
   maxLatencyMs: number;
-  errorRate: number; // 0-100
+  errorRate: number;
 }
 
 interface BatchMetrics {
@@ -23,18 +101,18 @@ interface BatchMetrics {
   totalLatencyMs: number;
   minLatencyMs: number;
   maxLatencyMs: number;
-  errorRate: number; // 0-100
+  errorRate: number;
+}
+
+interface QueueMetrics {
+  pendingEvents: number;
+  lastUpdatedAt: Date;
 }
 
 interface ThroughputMetrics {
   eventsPerSecond: number;
   batchesPerMinute: number;
   lastCalculatedAt: Date;
-}
-
-interface QueueMetrics {
-  pendingEvents: number;
-  lastUpdatedAt: Date;
 }
 
 interface MetricsSnapshot {
@@ -44,8 +122,6 @@ interface MetricsSnapshot {
   queue: QueueMetrics;
   collectedAt: Date;
 }
-
-// ─── Internal State ──────────────────────────────────────────────────────────
 
 const eventMetrics: EventMetrics = {
   totalEvents: 0,
@@ -74,7 +150,9 @@ let lastThroughputCalculation = Date.now();
 let eventCountAtLastCalculation = 0;
 let batchCountAtLastCalculation = 0;
 
-// ─── Event Metrics ───────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// ── Event Metrics ─────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
 
 /**
  * Record a successfully processed event
@@ -85,6 +163,9 @@ export function recordEventSuccess(latencyMs: number): void {
   eventMetrics.minLatencyMs = Math.min(eventMetrics.minLatencyMs, latencyMs);
   eventMetrics.maxLatencyMs = Math.max(eventMetrics.maxLatencyMs, latencyMs);
   updateEventErrorRate();
+  
+  indexerEventsProcessedSuccess.inc();
+  indexerEventProcessingLatency.observe(latencyMs);
 }
 
 /**
@@ -97,8 +178,11 @@ export function recordEventFailure(latencyMs?: number): void {
     eventMetrics.totalLatencyMs += latencyMs;
     eventMetrics.minLatencyMs = Math.min(eventMetrics.minLatencyMs, latencyMs);
     eventMetrics.maxLatencyMs = Math.max(eventMetrics.maxLatencyMs, latencyMs);
+    indexerEventProcessingLatency.observe(latencyMs);
   }
   updateEventErrorRate();
+  
+  indexerEventsProcessedFailure.inc();
 }
 
 /**
@@ -109,7 +193,9 @@ export function getAverageEventLatency(): number {
   return eventMetrics.totalLatencyMs / eventMetrics.totalEvents;
 }
 
-// ─── Batch Metrics ───────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// ── Batch Metrics ─────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
 
 /**
  * Record a successfully processed batch
@@ -120,6 +206,9 @@ export function recordBatchSuccess(latencyMs: number): void {
   batchMetrics.minLatencyMs = Math.min(batchMetrics.minLatencyMs, latencyMs);
   batchMetrics.maxLatencyMs = Math.max(batchMetrics.maxLatencyMs, latencyMs);
   updateBatchErrorRate();
+  
+  indexerBatchesProcessedSuccess.inc();
+  indexerBatchProcessingLatency.observe(latencyMs);
 }
 
 /**
@@ -132,8 +221,11 @@ export function recordBatchFailure(latencyMs?: number): void {
     batchMetrics.totalLatencyMs += latencyMs;
     batchMetrics.minLatencyMs = Math.min(batchMetrics.minLatencyMs, latencyMs);
     batchMetrics.maxLatencyMs = Math.max(batchMetrics.maxLatencyMs, latencyMs);
+    indexerBatchProcessingLatency.observe(latencyMs);
   }
   updateBatchErrorRate();
+  
+  indexerBatchesProcessedFailure.inc();
 }
 
 /**
@@ -144,7 +236,9 @@ export function getAverageBatchLatency(): number {
   return batchMetrics.totalLatencyMs / batchMetrics.totalBatches;
 }
 
-// ─── Queue Metrics ───────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// ── Queue Metrics ─────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
 
 /**
  * Update the number of pending events in queue
@@ -152,6 +246,7 @@ export function getAverageBatchLatency(): number {
 export function setQueueDepth(pendingCount: number): void {
   queueMetrics.pendingEvents = pendingCount;
   queueMetrics.lastUpdatedAt = new Date();
+  indexerQueueDepth.set(pendingCount);
 }
 
 /**
@@ -160,6 +255,7 @@ export function setQueueDepth(pendingCount: number): void {
 export function incrementQueueDepth(count: number = 1): void {
   queueMetrics.pendingEvents = Math.max(0, queueMetrics.pendingEvents + count);
   queueMetrics.lastUpdatedAt = new Date();
+  indexerQueueDepth.set(queueMetrics.pendingEvents);
 }
 
 /**
@@ -168,9 +264,12 @@ export function incrementQueueDepth(count: number = 1): void {
 export function decrementQueueDepth(count: number = 1): void {
   queueMetrics.pendingEvents = Math.max(0, queueMetrics.pendingEvents - count);
   queueMetrics.lastUpdatedAt = new Date();
+  indexerQueueDepth.set(queueMetrics.pendingEvents);
 }
 
-// ─── Throughput Metrics ──────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// ── Throughput Metrics ────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
 
 /**
  * Calculate events per second and batches per minute
@@ -194,10 +293,16 @@ function calculateThroughput(): { eventsPerSecond: number; batchesPerMinute: num
   eventCountAtLastCalculation = eventMetrics.totalEvents;
   batchCountAtLastCalculation = batchMetrics.totalBatches;
 
+  // Update Prometheus metrics
+  indexerThroughputEventsPerSecond.set(eventsPerSecond);
+  indexerThroughputBatchesPerMinute.set(batchesPerMinute);
+
   return { eventsPerSecond, batchesPerMinute };
 }
 
-// ─── Error Rate Calculations ─────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// ── Error Rate Calculations ───────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
 
 function updateEventErrorRate(): void {
   if (eventMetrics.totalEvents === 0) {
@@ -215,7 +320,9 @@ function updateBatchErrorRate(): void {
   }
 }
 
-// ─── Snapshot and Export ─────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// ── Snapshot and Export ───────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
 
 /**
  * Get a complete snapshot of all metrics
@@ -315,6 +422,13 @@ export function getPrometheusMetrics(): string {
   lines.push(`indexer_queue_depth ${snapshot.queue.pendingEvents}`);
 
   return lines.join('\n');
+}
+
+/**
+ * Export Prometheus metrics in text format
+ */
+export async function exportPrometheusMetrics(): Promise<string> {
+  return promRegister.metrics();
 }
 
 /**
