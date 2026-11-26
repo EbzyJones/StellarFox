@@ -7,7 +7,11 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { Market } from '../types';
 import type { MarketFilters, PaginationParams } from '../services/api';
-import { fetchMarkets } from '../services/api';
+import { fetchMarketsWithCache } from '../services/offlineApi';
+
+function getIsOnline(): boolean {
+  return typeof navigator !== 'undefined' ? navigator.onLine : true;
+}
 
 const POLL_INTERVAL = 30_000;
 
@@ -41,9 +45,10 @@ export function useMarkets(filters?: MarketFilters, pagination?: PaginationParam
 
   const fetchAndUpdate = useCallback(async () => {
     try {
-      const response = await fetchMarkets(
+      const response = await fetchMarketsWithCache(
         filtersKey !== 'null' ? (JSON.parse(filtersKey) as MarketFilters) : undefined,
         paginationKey !== 'null' ? (JSON.parse(paginationKey) as PaginationParams) : undefined,
+        getIsOnline(),
       );
       setMarkets(response.markets);
       setTotal(response.total);

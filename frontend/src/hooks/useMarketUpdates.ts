@@ -5,8 +5,13 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import type { Market } from '../types';
-import { fetchMarketById } from '../services/api';
+import { fetchMarketByIdWithCache } from '../services/offlineApi';
 import { WebSocketService, type MarketUpdateEvent } from '../services/websocket';
+
+// Determine online status at module-level for the initial fetch
+function getIsOnline(): boolean {
+  return typeof navigator !== 'undefined' ? navigator.onLine : true;
+}
 
 export interface UseMarketUpdatesResult {
   market: Market | null;
@@ -59,10 +64,10 @@ export function useMarketUpdates(marketId: string): UseMarketUpdatesResult {
     return SHOULD_POLL_STATUSES.includes(status as any);
   }, []);
 
-  // Fetch initial market data
+  // Fetch initial market data (uses local cache when offline)
   const fetchMarketData = useCallback(async () => {
     try {
-      const data = await fetchMarketById(marketId);
+      const data = await fetchMarketByIdWithCache(marketId, getIsOnline());
       if (!isMountedRef.current) return;
 
       setMarket(data);
@@ -160,7 +165,7 @@ export function useMarketUpdates(marketId: string): UseMarketUpdatesResult {
           if (!isMountedRef.current) return;
 
           try {
-            const updated = await fetchMarketById(marketId);
+            const updated = await fetchMarketByIdWithCache(marketId, getIsOnline());
             if (!isMountedRef.current) return;
 
             setMarket(updated);

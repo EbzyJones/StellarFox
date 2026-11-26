@@ -8,6 +8,7 @@ import { Inter } from 'next/font/google';
 import { Header } from '../components/layout/Header';
 import { Breadcrumb } from '../components/layout/Breadcrumb';
 import { QueryProvider } from '../providers/QueryProvider';
+import { OfflineProvider } from '../providers/OfflineProvider';
 import { ToastProvider } from '../components/ui/ToastProvider';
 import { PWAInstallPrompt } from '../components/ui/PWAInstallPrompt';
 import { PWAUpdateBanner } from '../components/ui/PWAUpdateBanner';
@@ -66,6 +67,11 @@ export default function RootLayout({ children }: { children: React.ReactNode }):
       <body className="bg-white dark:bg-gray-950 text-gray-900 dark:text-white min-h-screen transition-colors">
         <QueryProvider>
           <ToastProvider>
+            <OfflineProvider>
+              <Header />
+              <Breadcrumb />
+              {children}
+            </OfflineProvider>
             <Header />
             <Breadcrumb />
             {children}
