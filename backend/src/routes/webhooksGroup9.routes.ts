@@ -3,7 +3,6 @@ import { validateBody, validateQuery, validateParams } from '../api/middleware/v
 import { requireAuth } from '../middleware/auth.middleware';
 import { requireAdminJwt } from '../middleware/requireAdminJwt.middleware';
 import { rateLimit } from '../middleware/rate-limit.middleware';
-import { pool } from '../config/db';
 import {
   createWebhookGroup9BodySchema,
   webhookIdParamGroup9Schema,
@@ -14,15 +13,28 @@ import {
   ListDeliveriesGroup9Query,
   ReplayWebhookDeliveriesGroup9Body,
 } from '../schemas/webhooksGroup9.schemas';
+import * as webhookService from '../services/webhook.service';
 
 const router = Router();
+
+// ---------------------------------------------------------------------------
+// Helper to extract userId set by the auth middleware
+// ---------------------------------------------------------------------------
+function userId(req: Request): string {
+  return (req as unknown as { userId: string }).userId;
+}
 
 /**
  * @swagger
  * /api/v2/webhooks/subscriptions:
  *   post:
- *     summary: Register a new webhook subscription endpoint with HMAC secret and event topics
- *     tags: [Webhooks Group 9]
+ *     summary: Register a new webhook subscription
+ *     description: >
+ *       Creates a subscription that will receive signed HTTPS POST requests
+ *       for each subscribed event topic.  The secret you provide is used for
+ *       HMAC-SHA256 request signing; it is never returned after this response.
+ *       Verify inbound requests with the `X-StellarFox-Signature` header.
+ *     tags: [Webhooks]
  */
 router.post(
   '/subscriptions',
@@ -32,35 +44,27 @@ router.post(
   async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
       const body = req.body as CreateWebhookGroup9Body;
-      const userId = (req as unknown as { userId?: string }).userId;
-
-      const newWebhook = {
-        id: `whk-${Date.now()}`,
-        user_id: userId,
+      const subscription = await webhookService.createSubscription({
+        userId: userId(req),
         url: body.url,
-        topics: body.topics,
-        description: body.description || null,
-        status: 'active',
-        created_at: new Date().toISOString(),
-      };
-
-      res.status(201).json({
-        success: true,
-        message: 'Webhook subscription created successfully',
-        data: newWebhook,
+        secret: body.secret,
+        topics: body.topics as webhookService.WebhookTopic[],
+        description: body.description,
       });
+
+      res.status(201).json({ success: true, data: subscription });
     } catch (err) {
       next(err);
     }
-  }
+  },
 );
 
 /**
  * @swagger
  * /api/v2/webhooks/subscriptions:
  *   get:
- *     summary: List all active webhook endpoints configured by authenticated user
- *     tags: [Webhooks Group 9]
+ *     summary: List webhook subscriptions for the authenticated user
+ *     tags: [Webhooks]
  */
 router.get(
   '/subscriptions',
@@ -68,37 +72,20 @@ router.get(
   requireAuth,
   async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
-      const userId = (req as unknown as { userId?: string }).userId;
-
-      const mockSubscriptions = [
-        {
-          id: 'whk-sample-01',
-          user_id: userId,
-          url: 'https://example-bot.com/webhooks/bankerchanger',
-          topics: ['market.resolved', 'payout.distributed'],
-          description: 'Production alert bot',
-          status: 'active',
-          last_delivery_at: new Date(Date.now() - 3600000).toISOString(),
-          created_at: new Date(Date.now() - 86400000).toISOString(),
-        },
-      ];
-
-      res.status(200).json({
-        success: true,
-        data: mockSubscriptions,
-      });
+      const subscriptions = await webhookService.listSubscriptions(userId(req));
+      res.status(200).json({ success: true, data: subscriptions });
     } catch (err) {
       next(err);
     }
-  }
+  },
 );
 
 /**
  * @swagger
  * /api/v2/webhooks/subscriptions/{id}:
  *   delete:
- *     summary: Remove/deactivate an active webhook subscription endpoint
- *     tags: [Webhooks Group 9]
+ *     summary: Deactivate a webhook subscription
+ *     tags: [Webhooks]
  */
 router.delete(
   '/subscriptions/:id',
@@ -108,23 +95,27 @@ router.delete(
   async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
       const { id } = req.params as unknown as WebhookIdParamGroup9;
-
-      res.status(200).json({
-        success: true,
-        message: `Webhook subscription ${id} deactivated successfully`,
-      });
+      const deleted = await webhookService.deleteSubscription(id, userId(req));
+      if (!deleted) {
+        res.status(404).json({ success: false, message: 'Subscription not found or already disabled' });
+        return;
+      }
+      res.status(200).json({ success: true, message: `Subscription ${id} disabled` });
     } catch (err) {
       next(err);
     }
-  }
+  },
 );
 
 /**
  * @swagger
  * /api/v2/webhooks/subscriptions/{id}/test:
  *   post:
- *     summary: Dispatch test ping payload to verify webhook destination endpoint response
- *     tags: [Webhooks Group 9]
+ *     summary: Send a test ping to a webhook endpoint
+ *     description: >
+ *       Dispatches a synthetic `ping` event to verify that the endpoint is
+ *       reachable and responding with a 2xx status code.
+ *     tags: [Webhooks]
  */
 router.post(
   '/subscriptions/:id/test',
@@ -134,30 +125,35 @@ router.post(
   async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
       const { id } = req.params as unknown as WebhookIdParamGroup9;
+      const result = await webhookService.sendTestPing(id, userId(req));
 
-      res.status(200).json({
-        success: true,
-        message: `Test ping dispatched to webhook ${id}`,
+      res.status(result.delivered ? 200 : 502).json({
+        success: result.delivered,
+        message: result.delivered ? 'Test ping delivered' : 'Endpoint returned a non-2xx response',
         data: {
           test_event_id: `evt-ping-${Date.now()}`,
-          delivered: true,
-          http_status_code: 200,
-          latency_ms: 142,
+          delivered: result.delivered,
+          http_status_code: result.httpStatus,
+          latency_ms: result.latencyMs,
+          error: result.error,
           dispatched_at: new Date().toISOString(),
         },
       });
     } catch (err) {
       next(err);
     }
-  }
+  },
 );
 
 /**
  * @swagger
  * /api/v2/webhooks/deliveries:
  *   get:
- *     summary: Retrieve delivery logs, retry counts, and HTTP status codes for webhook dispatches
- *     tags: [Webhooks Group 9]
+ *     summary: Retrieve delivery logs for the authenticated user's webhooks
+ *     description: >
+ *       Returns paginated delivery records including attempt counts, HTTP
+ *       status codes, error messages, and retry schedule.
+ *     tags: [Webhooks]
  */
 router.get(
   '/deliveries',
@@ -167,41 +163,41 @@ router.get(
   async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
       const query = req.query as unknown as ListDeliveriesGroup9Query;
-      const { page = 1, limit = 20, status } = query;
+      const { page = 1, limit = 20 } = query;
 
-      const mockDeliveries = [
-        {
-          delivery_id: 'del-901',
-          webhook_id: query.webhook_id || 'whk-sample-01',
-          event_type: 'market.resolved',
-          status: status || 'success',
-          http_status: 200,
-          attempts: 1,
-          created_at: new Date(Date.now() - 1200000).toISOString(),
-        },
-      ];
+      const { data, total } = await webhookService.listDeliveries({
+        userId: userId(req),
+        webhookId: query.webhook_id,
+        status: query.status as webhookService.WebhookDelivery['status'] | undefined,
+        page,
+        limit,
+      });
 
       res.status(200).json({
         success: true,
         pagination: {
           page,
           limit,
-          total: mockDeliveries.length,
+          total,
+          pages: Math.ceil(total / limit),
         },
-        data: mockDeliveries,
+        data,
       });
     } catch (err) {
       next(err);
     }
-  }
+  },
 );
 
 /**
  * @swagger
  * /api/v2/webhooks/admin/replay:
  *   post:
- *     summary: Admin-gated batch replay for failed webhook deliveries
- *     tags: [Webhooks Group 9]
+ *     summary: Admin – batch replay failed webhook deliveries
+ *     description: >
+ *       Re-queues the specified delivery IDs for immediate re-dispatch.
+ *       Only deliveries in `failed` or `exhausted` state are eligible.
+ *     tags: [Webhooks]
  */
 router.post(
   '/admin/replay',
@@ -211,19 +207,21 @@ router.post(
   async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
       const body = req.body as ReplayWebhookDeliveriesGroup9Body;
+      const { queued, skipped } = await webhookService.replayDeliveries(body.delivery_ids);
 
       res.status(200).json({
         success: true,
-        message: `Dispatched replay for ${body.delivery_ids.length} deliveries`,
+        message: `Queued ${queued.length} deliveries for replay`,
         data: {
-          replayed_count: body.delivery_ids.length,
+          queued,
+          skipped,
           queued_at: new Date().toISOString(),
         },
       });
     } catch (err) {
       next(err);
     }
-  }
+  },
 );
 
 export default router;

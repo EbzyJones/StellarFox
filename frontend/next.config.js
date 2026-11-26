@@ -32,9 +32,26 @@ const nextConfig = {
   // Production source maps disabled by default for bundle size
   productionBrowserSourceMaps: process.env.ENABLE_SOURCE_MAPS === 'true',
 
-  // Headers for caching static assets
+  // Headers for caching static assets and correct SW delivery
   async headers() {
     return [
+      // Service worker must NOT be cached so the browser picks up new versions immediately.
+      {
+        source: '/sw.js',
+        headers: [
+          { key: 'Cache-Control', value: 'no-store, no-cache, must-revalidate' },
+          { key: 'Service-Worker-Allowed', value: '/' },
+          { key: 'Content-Type', value: 'application/javascript; charset=utf-8' },
+        ],
+      },
+      // Web App Manifest
+      {
+        source: '/manifest.json',
+        headers: [
+          { key: 'Cache-Control', value: 'public, max-age=86400' },
+          { key: 'Content-Type', value: 'application/manifest+json' },
+        ],
+      },
       {
         source: '/static/:path*',
         headers: [
@@ -51,6 +68,13 @@ const nextConfig = {
             key: 'Cache-Control',
             value: 'public, max-age=31536000, immutable',
           },
+        ],
+      },
+      // PWA icons — long cache with revalidation
+      {
+        source: '/icons/:path*',
+        headers: [
+          { key: 'Cache-Control', value: 'public, max-age=604800, stale-while-revalidate=86400' },
         ],
       },
     ];

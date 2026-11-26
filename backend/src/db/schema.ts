@@ -1116,3 +1116,66 @@ export type ReferralPayout = typeof referral_payouts.$inferSelect;
 export type NewReferralPayout = typeof referral_payouts.$inferInsert;
 export type UserNotification = typeof user_notifications.$inferSelect;
 export type NewUserNotification = typeof user_notifications.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// Webhook system
+// ---------------------------------------------------------------------------
+
+export const webhookSubscriptions = pgTable(
+  'webhook_subscriptions',
+  {
+    id: text('id').primaryKey(),
+    user_id: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    url: text('url').notNull(),
+    /** SHA-256 of the caller-supplied secret. Never store plaintext. */
+    secret_hash: text('secret_hash').notNull(),
+    /** JSONB array of topic strings, e.g. ["market.resolved", "bet.placed"] */
+    topics: jsonb('topics').notNull().default([]),
+    description: text('description'),
+    status: text('status').notNull().default('active'), // 'active' | 'paused' | 'disabled'
+    failure_count: integer('failure_count').notNull().default(0),
+    last_delivery_at: timestamp('last_delivery_at', { withTimezone: true }),
+    created_at: timestamp('created_at', { withTimezone: true }).defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => ({
+    user_id_idx: index('webhook_subscriptions_user_id_idx').on(table.user_id),
+    status_idx: index('webhook_subscriptions_status_idx').on(table.status),
+    topics_gin_idx: index('webhook_subscriptions_topics_gin_idx').using('gin', table.topics),
+  }),
+);
+
+export const webhookDeliveries = pgTable(
+  'webhook_deliveries',
+  {
+    id: text('id').primaryKey(),
+    webhook_id: text('webhook_id')
+      .notNull()
+      .references(() => webhookSubscriptions.id, { onDelete: 'cascade' }),
+    event_id: text('event_id').notNull(),
+    event_type: text('event_type').notNull(),
+    payload: jsonb('payload').notNull(),
+    /** pending → retrying → success | exhausted */
+    status: text('status').notNull().default('pending'),
+    attempt_count: integer('attempt_count').notNull().default(0),
+    last_http_status: integer('last_http_status'),
+    last_error: text('last_error'),
+    next_retry_at: timestamp('next_retry_at', { withTimezone: true }),
+    delivered_at: timestamp('delivered_at', { withTimezone: true }),
+    created_at: timestamp('created_at', { withTimezone: true }).defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => ({
+    webhook_id_idx: index('webhook_deliveries_webhook_id_idx').on(table.webhook_id),
+    event_id_idx: index('webhook_deliveries_event_id_idx').on(table.event_id),
+    status_idx: index('webhook_deliveries_status_idx').on(table.status),
+    retry_idx: index('webhook_deliveries_retry_idx').on(table.status, table.next_retry_at),
+  }),
+);
+
+export type WebhookSubscription = typeof webhookSubscriptions.$inferSelect;
+export type NewWebhookSubscription = typeof webhookSubscriptions.$inferInsert;
+export type WebhookDelivery = typeof webhookDeliveries.$inferSelect;
+export type NewWebhookDelivery = typeof webhookDeliveries.$inferInsert;
