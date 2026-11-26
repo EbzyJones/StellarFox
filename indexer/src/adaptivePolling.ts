@@ -5,6 +5,10 @@
 
 import { calculateBackoff, loadBackoffConfigFromEnv } from './backoff';
 
+// Re-export the shared circuit breaker so callers that previously imported
+// PollingCircuitBreaker from this module don't need to change their import path.
+export { CircuitBreaker as PollingCircuitBreaker, getCircuitBreaker, CircuitBreakerError } from './circuitBreaker';
+
 export interface AdaptivePollingConfig {
   minIntervalMs: number;
   maxIntervalMs: number;
@@ -210,94 +214,9 @@ export class AdaptivePoller {
 }
 
 /**
- * Implements circuit breaker pattern for polling
+ * Implements circuit breaker pattern for polling.
+ * @deprecated Use `PollingCircuitBreaker` (re-exported from `./circuitBreaker`) instead.
+ * This stub is kept for any code that constructs it via `new PollingCircuitBreaker(...)`
+ * with custom thresholds before the registry was available.
  */
-export class PollingCircuitBreaker {
-  private state: 'closed' | 'open' | 'half-open' = 'closed';
-  private failureCount = 0;
-  private successCount = 0;
-  private lastFailureTime: number | null = null;
-  private readonly failureThreshold: number;
-  private readonly successThreshold: number;
-  private readonly resetTimeoutMs: number;
-
-  constructor(failureThreshold = 5, successThreshold = 2, resetTimeoutMs = 60000) {
-    this.failureThreshold = failureThreshold;
-    this.successThreshold = successThreshold;
-    this.resetTimeoutMs = resetTimeoutMs;
-  }
-
-  /**
-   * Records a failed poll attempt
-   */
-  recordFailure(): void {
-    this.failureCount++;
-    this.lastFailureTime = Date.now();
-
-    if (this.failureCount >= this.failureThreshold) {
-      this.state = 'open';
-      console.error(
-        `[CircuitBreaker] Circuit opened after ${this.failureCount} failures. Pausing polls.`,
-      );
-    }
-  }
-
-  /**
-   * Records a successful poll attempt
-   */
-  recordSuccess(): void {
-    if (this.state === 'half-open') {
-      this.successCount++;
-      if (this.successCount >= this.successThreshold) {
-        this.state = 'closed';
-        this.failureCount = 0;
-        this.successCount = 0;
-        console.info('[CircuitBreaker] Circuit closed. Resuming normal polling.');
-      }
-    } else if (this.state === 'closed') {
-      // Reset failure count on success in closed state
-      this.failureCount = Math.max(0, this.failureCount - 1);
-    }
-  }
-
-  /**
-   * Checks if polling should continue
-   */
-  canProceed(): boolean {
-    if (this.state === 'closed') return true;
-
-    if (this.state === 'open') {
-      // Attempt recovery after timeout
-      if (
-        this.lastFailureTime &&
-        Date.now() - this.lastFailureTime >= this.resetTimeoutMs
-      ) {
-        this.state = 'half-open';
-        this.successCount = 0;
-        console.info('[CircuitBreaker] Attempting recovery (half-open state).');
-        return true;
-      }
-      return false;
-    }
-
-    // Half-open: allow test polls
-    return true;
-  }
-
-  /**
-   * Gets circuit breaker state
-   */
-  getState(): 'closed' | 'open' | 'half-open' {
-    return this.state;
-  }
-
-  /**
-   * Resets the circuit breaker
-   */
-  reset(): void {
-    this.state = 'closed';
-    this.failureCount = 0;
-    this.successCount = 0;
-    this.lastFailureTime = null;
-  }
-}
+// (class removed — see re-export above)

@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import nodemailer from 'nodemailer';
 import { logger } from '../utils/logger';
+import { getCircuitBreaker, CircuitBreakerError } from '../utils/circuitBreaker';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -76,6 +77,17 @@ function createTransporter(): nodemailer.Transporter {
 
 const transporter = createTransporter();
 
+// Circuit breaker for outbound email delivery.
+// Opens after 5 consecutive delivery failures and re-probes after 2 minutes.
+// Because sendEmail never throws (by design), the breaker's main effect is to
+// skip the SMTP/SendGrid round-trip while the downstream is known-unhealthy,
+// avoiding thread stalls and connection pool exhaustion.
+const EMAIL_CB = getCircuitBreaker('email-smtp', {
+  failureThreshold: 5,
+  resetTimeoutMs: 120_000,
+  callTimeoutMs: 30_000,
+});
+
 // ---------------------------------------------------------------------------
 // Template rendering
 // ---------------------------------------------------------------------------
@@ -116,17 +128,23 @@ export async function sendEmail(
   const mergedData = { appName: APP_NAME, ...data };
   try {
     const html = renderTemplate(template, mergedData);
-    const info = await transporter.sendMail({
-      from: `"${APP_NAME}" <${FROM_ADDRESS}>`,
-      to,
-      subject: SUBJECTS[template],
-      html,
-    });
+    const info = await EMAIL_CB.execute(() =>
+      transporter.sendMail({
+        from: `"${APP_NAME}" <${FROM_ADDRESS}>`,
+        to,
+        subject: SUBJECTS[template],
+        html,
+      }),
+    );
     if (process.env.NODE_ENV !== 'production') {
       logger.info({ msg: `Email sent (dev)`, template, messageId: info.messageId });
     }
   } catch (err) {
-    logger.error({ msg: 'Failed to send email', template, to, error: err });
+    if (err instanceof CircuitBreakerError) {
+      logger.warn({ msg: 'Email skipped — SMTP circuit breaker is open', template, to });
+    } else {
+      logger.error({ msg: 'Failed to send email', template, to, error: err });
+    }
   }
 }
 
@@ -171,14 +189,20 @@ export async function sendExportReadyEmail(
 ): Promise<void> {
   const filename = `${exportType}-export-${new Date().toISOString().slice(0, 10)}.csv`;
   try {
-    await transporter.sendMail({
-      from: `"${APP_NAME}" <${FROM_ADDRESS}>`,
-      to: toEmail,
-      subject: `[${APP_NAME}] Your ${exportType} export is ready`,
-      text: `Your requested ${exportType} export is attached as ${filename}.`,
-      attachments: [{ filename, content: csvContent, contentType: 'text/csv' }],
-    });
+    await EMAIL_CB.execute(() =>
+      transporter.sendMail({
+        from: `"${APP_NAME}" <${FROM_ADDRESS}>`,
+        to: toEmail,
+        subject: `[${APP_NAME}] Your ${exportType} export is ready`,
+        text: `Your requested ${exportType} export is attached as ${filename}.`,
+        attachments: [{ filename, content: csvContent, contentType: 'text/csv' }],
+      }),
+    );
   } catch (err) {
-    logger.error({ msg: 'Failed to send export ready email', error: err });
+    if (err instanceof CircuitBreakerError) {
+      logger.warn({ msg: 'Export email skipped — SMTP circuit breaker is open', exportType });
+    } else {
+      logger.error({ msg: 'Failed to send export ready email', error: err });
+    }
   }
 }

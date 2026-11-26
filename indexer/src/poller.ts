@@ -4,6 +4,7 @@ import { updateLastLedger, setDatabaseHealth, setRpcHealth } from './health';
 import { detectLedgerAnomaly, computeResyncStartLedger } from './ledgerContinuity';
 import { calculateBackoff, loadBackoffConfigFromEnv } from './backoff';
 import { broadcast } from './ws';
+import { getCircuitBreaker, CircuitBreakerError } from './circuitBreaker';
 import { 
   recordEventSuccess, 
   recordEventFailure, 
@@ -34,6 +35,21 @@ if (!CONTRACT_ID) {
 }
 
 const server = new rpc.Server(RPC_URL);
+
+// ── Circuit breakers for external Stellar RPC calls ──────────────────────
+// One breaker for event polling (high-frequency, tolerates more failures before
+// opening) and one for the getLatestLedger probe (used to seed the start ledger).
+const rpcPollCb = getCircuitBreaker('indexer-rpc-poll', {
+  failureThreshold: 5,
+  resetTimeoutMs: 30_000,
+  callTimeoutMs: 20_000,
+});
+
+const rpcLedgerCb = getCircuitBreaker('indexer-rpc-ledger', {
+  failureThreshold: 5,
+  resetTimeoutMs: 30_000,
+  callTimeoutMs: 10_000,
+});
 
 // ── Enhanced polling configuration ──────────────────────────────────────
 const ADAPTIVE_POLLING_CONFIG = {
@@ -221,7 +237,24 @@ export async function pollEvents() {
           paginatedRequest.startLedger = request.startLedger;
         }
 
-        const response = await server.getEvents(paginatedRequest);
+        let response: Awaited<ReturnType<typeof server.getEvents>>;
+        try {
+          response = await rpcPollCb.execute(() => server.getEvents(paginatedRequest));
+        } catch (err) {
+          if (err instanceof CircuitBreakerError) {
+            log('warn', 'RPC poll circuit breaker is OPEN — skipping this poll cycle', {
+              breaker: err.breakerName,
+              state: err.state,
+            });
+            setRpcHealth(false, `Circuit breaker ${err.breakerName} is ${err.state}`);
+            // Treat as a temporary skip: break the pagination loop without
+            // counting it as a full poll failure so the outer loop can still
+            // apply its own backoff and retry logic.
+            hasMore = false;
+            break;
+          }
+          throw err;
+        }
 
         // Process all events on this page
         if (response.events && response.events.length > 0) {
@@ -420,12 +453,19 @@ export async function pollEvents() {
 
 async function getLatestLedger(): Promise<number> {
   try {
-    const health = await server.getLatestLedger();
+    const health = await rpcLedgerCb.execute(() => server.getLatestLedger());
     return health.sequence;
   } catch (err) {
-    log('error', 'Failed to get latest ledger', {
-      error: err instanceof Error ? err.message : String(err),
-    });
+    if (err instanceof CircuitBreakerError) {
+      log('warn', 'RPC ledger circuit breaker is OPEN — using fallback ledger 1', {
+        breaker: err.breakerName,
+        state: err.state,
+      });
+    } else {
+      log('error', 'Failed to get latest ledger', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
     // Return a conservative starting point
     return 1;
   }

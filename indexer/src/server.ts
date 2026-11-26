@@ -6,6 +6,7 @@ import { isLive, isReady, getReadinessDetails, setDatabaseHealth } from './healt
 import { getMetricsSnapshot, getPrometheusMetrics } from './metrics';
 import { getCheckpointStats, getAllCheckpoints, getRecoveryInfo } from './checkpointRecovery';
 import { getEventFilter, getSamplingConfig, getFilteringStats } from './eventFiltering';
+import { getCircuitBreakerStatus } from './circuitBreaker';
 
 const app = express();
 
@@ -82,6 +83,7 @@ app.get('/health', (req: Request, res: Response) => {
   try {
     const health = getPollerHealth();
     const ready = isReady();
+    const circuitBreakers = getCircuitBreakerStatus();
     
     // Return 200 if poller is running and ready, 503 if not
     const statusCode = (health.isRunning && ready) ? 200 : 503;
@@ -102,6 +104,7 @@ app.get('/health', (req: Request, res: Response) => {
         ledgerGapsDetected: health.ledgerGapsDetected,
         lastLedgerGapAt: health.lastLedgerGapAt,
       },
+      circuitBreakers,
     });
   } catch (err: any) {
     res.status(500).json({ 
@@ -183,6 +186,29 @@ app.get('/filtering/status', (req: Request, res: Response) => {
         sampling: getSamplingConfig(),
         stats: filteringStats,
       },
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  }
+});
+
+/**
+ * Circuit breaker status endpoint: Returns state and failure count for every
+ * registered circuit breaker. Useful for dashboards and alerting.
+ * A breaker in state OPEN means the corresponding external service is unhealthy.
+ */
+app.get('/circuit-breakers', (req: Request, res: Response) => {
+  try {
+    const breakers = getCircuitBreakerStatus();
+    const hasOpen = breakers.some((b) => b.state === 'OPEN');
+    res.status(hasOpen ? 207 : 200).json({
+      success: true,
+      healthy: !hasOpen,
+      circuitBreakers: breakers,
       timestamp: new Date().toISOString(),
     });
   } catch (err: any) {
